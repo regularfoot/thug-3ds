@@ -1,0 +1,17 @@
+/private/
+/build/
+/out/
+__pycache__/
+*.pyc
+.DS_Store
+/Code/
+/Scripts/
+/Game/
+/data/
+/dist/
+source-saves/
+*.3dsx
+*.smdh
+*.elf
+*.bik
+*.dmp

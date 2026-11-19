@@ -1,0 +1,5 @@
+meshoptimizer v1.0
+https://github.com/zeux/meshoptimizer/tree/73583c335e541c139821d0de2bf5f12960a04941
+
+Unmodified upstream allocator, simplifier and public header. Built only by
+the host-side THUG1 scene LOD baker. See LICENSE.md.

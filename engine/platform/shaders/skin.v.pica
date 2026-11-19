@@ -1,0 +1,51 @@
+; One compact palette, shared between eyes. Indices already address rows.
+.fvec clipMatrix[4]
+.fvec boneRows[72]
+.fvec skinUV
+.bool useBones
+.constf constants(0.0, 1.0, 0.00392156862745, 0.0)
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.in position v0
+.in color v1
+.in uv v2
+.in boneIndex v3
+.in weight v4
+.proc main
+    mov r0.xyz, position.xyz
+    mov r0.w, constants.yyyy
+    ifu useBones
+    mova a0.x, boneIndex.xxxx
+    dp4 r1.x, boneRows[a0.x + 0], r0
+    dp4 r1.y, boneRows[a0.x + 1], r0
+    dp4 r1.z, boneRows[a0.x + 2], r0
+    mul r2.xyz, r1.xyz, weight.xxxx
+    mova a0.x, boneIndex.yyyy
+    dp4 r1.x, boneRows[a0.x + 0], r0
+    dp4 r1.y, boneRows[a0.x + 1], r0
+    dp4 r1.z, boneRows[a0.x + 2], r0
+    mul r1.xyz, r1.xyz, weight.yyyy
+    add r2.xyz, r2.xyz, r1.xyz
+    mova a0.x, boneIndex.zzzz
+    dp4 r1.x, boneRows[a0.x + 0], r0
+    dp4 r1.y, boneRows[a0.x + 1], r0
+    dp4 r1.z, boneRows[a0.x + 2], r0
+    mul r1.xyz, r1.xyz, weight.zzzz
+    add r2.xyz, r2.xyz, r1.xyz
+    mov r2.w, constants.yyyy
+    mul r3.xy, skinUV.xy, uv.xy
+    add r3.y, skinUV.zzzz, r3.yyyy
+    mov r3.zw, uv.zw
+    .else
+    mov r2, r0
+    mov r3, uv
+    .end
+    mov outtc0, r3
+    dp4 outpos.x, clipMatrix[0], r2
+    dp4 outpos.y, clipMatrix[1], r2
+    dp4 outpos.z, clipMatrix[2], r2
+    dp4 outpos.w, clipMatrix[3], r2
+    mul outclr, constants.zzzz, color
+    end
+.end

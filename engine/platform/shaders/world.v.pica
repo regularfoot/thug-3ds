@@ -1,0 +1,23 @@
+; Native raster input for the whole original engine. Every declared output is
+; written in full: partial texcoord writes hang physical PICA200 hardware.
+.fvec clipMatrix[4]
+.constf constants(0.0, 1.0, 0.00392156862745, 0.0)
+.alias ones constants.yyyy
+.alias colorScale constants.zzzz
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.alias inpos v0
+.alias inclr v1
+.alias intc0 v2
+.proc main
+    mov r0.xyz, inpos.xyz
+    mov r0.w, ones
+    dp4 outpos.x, clipMatrix[0], r0
+    dp4 outpos.y, clipMatrix[1], r0
+    dp4 outpos.z, clipMatrix[2], r0
+    dp4 outpos.w, clipMatrix[3], r0
+    mul outclr, colorScale, inclr
+    mov outtc0, intc0
+    end
+.end
