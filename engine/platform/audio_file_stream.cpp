@@ -1,4 +1,5 @@
 #include <source_port/media_os.h>
+#include <source_port/application_os.h>
 #include <source_port/clock_os.h>
 #include <source_port/diagnostics.h>
 #include <source_port/thread_os.h>
@@ -32,6 +33,11 @@ struct Slot {
 
 Slot slots[audio_file_slots];
 SourceThreadOS* worker = nullptr;
+SourceThreadOS* music_worker = nullptr;
+struct SlotRange { unsigned first, count; };
+SlotRange all_slots{1, audio_file_slots};
+SlotRange effect_slots{1, audio_file_slots - 1};
+SlotRange music_slot{0, 1};
 std::atomic<bool> stopping{false};
 std::atomic_flag lock = ATOMIC_FLAG_INIT;
 
@@ -48,7 +54,8 @@ struct Decoder {
     SourceMediaCodec* codec = nullptr;
     std::int64_t start = 0, length = 0, position = 0;
     unsigned generation = 0;
-    std::uint64_t last_delay_log = 0;
+    std::uint64_t last_delay_log = 0, decoded_frames = 0;
+    std::uint64_t file_ticks = 0;
 
     void Close() {
         source_media_close(codec);
@@ -63,7 +70,9 @@ struct Decoder {
         if (requested < 0) return -EINVAL;
         const auto count = std::min<std::int64_t>(requested, decoder.length - decoder.position);
         if (!count) return 0;
+        const auto started = source_clock_now();
         const auto read = std::fread(bytes, 1, count, decoder.file);
+        decoder.file_ticks += source_clock_now() - started;
         decoder.position += read;
         return read ? static_cast<int>(read) : -EIO;
     }
@@ -81,7 +90,10 @@ struct Decoder {
         }
         if (offset < -base || offset > decoder.length - base) return -EINVAL;
         const auto position = base + offset;
-        if (std::fseek(decoder.file, long(decoder.start + position), SEEK_SET)) return -EIO;
+        const auto started = source_clock_now();
+        const int result = std::fseek(decoder.file, long(decoder.start + position), SEEK_SET);
+        decoder.file_ticks += source_clock_now() - started;
+        if (result) return -EIO;
         return decoder.position = position;
     }
 
@@ -114,10 +126,11 @@ bool Fill(Slot& slot, Decoder& decoder, float* block) {
         } else if (!decoder.codec || slot.size == blocks_per_stream) return false;
     }
     const auto started=source_clock_now();
+    decoder.file_ticks=0;
     if (opening) {
         decoder.Close();
         decoder.generation = request.generation;
-        decoder.last_delay_log = 0;
+        decoder.last_delay_log = decoder.decoded_frames = 0;
         if (!request.path[0]) return true;
         if (!decoder.Open(request)) decoder.Close();
     }
@@ -140,6 +153,16 @@ bool Fill(Slot& slot, Decoder& decoder, float* block) {
         slot.rate = rate;
         slot.state = failed ? AudioFileState::Failed : ended ? AudioFileState::Ended : AudioFileState::Ready;
     }
+    if (&slot == &slots[0]) {
+        const auto previous = decoder.decoded_frames;
+        decoder.decoded_frames += frames;
+        const auto checkpoint = std::uint64_t(rate) * 12;
+        if (opening || failed || ended || (previous < checkpoint && decoder.decoded_frames >= checkpoint)) {
+            Log("MUSIC_DECODE state=%s frames=%llu rate=%u generation=%u",
+                failed ? "failed" : ended ? "end" : opening ? "start" : "playing",
+                static_cast<unsigned long long>(decoder.decoded_frames), rate, decoder.generation);
+        }
+    }
     const auto now=source_clock_now();
     const auto ticks=now-started;
     const auto frequency=source_clock_frequency();
@@ -148,41 +171,54 @@ bool Fill(Slot& slot, Decoder& decoder, float* block) {
     if(failed || (ticks>=frequency/20 &&
         (!decoder.last_delay_log || now-decoder.last_delay_log>=2*frequency))){
         decoder.last_delay_log=now;
-        Log("AUDIO_IO slot=%u phase=%s ms=%llu frames=%u failed=%u",
-            unsigned(&slot-slots),opening?"open":"decode",static_cast<unsigned long long>(ticks*1000/frequency),frames,unsigned(failed));
+        Log("AUDIO_IO slot=%u phase=%s ms=%llu frames=%u failed=%u read_seek_ms=%llu",
+            unsigned(&slot-slots),opening?"open":"decode",static_cast<unsigned long long>(ticks*1000/frequency),frames,unsigned(failed),
+            static_cast<unsigned long long>(decoder.file_ticks*1000/frequency));
     }
     return true;
 }
 
-void DecodeAudio(void*, void*) {
+void DecodeAudio(void* context, void*) {
+    const auto range = *static_cast<SlotRange*>(context);
     Decoder decoders[audio_file_slots];
     float block[block_frames * 2];
     while (!stopping.load(std::memory_order_acquire)) {
         bool work = false;
-        for (unsigned i = 0; i < audio_file_slots && !stopping.load(std::memory_order_relaxed); ++i) {
+        for (unsigned i = 0; i < range.count && !stopping.load(std::memory_order_relaxed); ++i) {
             // Give dialog slots the first read each round.
-            const unsigned slot = (i + 1) % audio_file_slots;
+            const unsigned slot = (i + range.first) % audio_file_slots;
             work |= Fill(slots[slot], decoders[slot], block);
         }
         // Yield to the controller, including while filling the startup buffer.
         source_thread_sleep_ms(work ? 1 : 3);
     }
 }
+SourceThreadOS* StartDecoder(SlotRange& range) {
+    std::uint32_t id;
+    auto* thread = source_thread_create(DecodeAudio, &range, 128 * 1024, 10, &id);
+    if (thread && source_thread_start(thread, nullptr) != 0) {
+        source_thread_destroy(thread);
+        return nullptr;
+    }
+    return thread;
+}
 }
 
 bool StartAudioFileWorker() {
     if (worker) return true;
-    std::uint32_t id;
     stopping.store(false, std::memory_order_relaxed);
-    // On core 0 use priority 0x2f, one step above the controller. A
-    // busy city can otherwise starve a 21 ms PCM block for several frames.
-    // The worker yields after each bounded batch and while SD I/O waits.
-    worker = source_thread_create(DecodeAudio, nullptr, 128 * 1024, 10, &id);
-    if (!worker) return false;
-    if (source_thread_start(worker, nullptr) == 0) return true;
-    source_thread_destroy(worker);
-    worker = nullptr;
-    return false;
+    // A slow seek in the dialogue WAD must not hold up the soundtrack.
+    // Keep a single stack on Old 3DS and on systems without a spare thread.
+    if (!source_application_os_is_old_3ds()) music_worker = StartDecoder(music_slot);
+    worker = StartDecoder(music_worker ? effect_slots : all_slots);
+    if (!worker && music_worker) {
+        stopping.store(true, std::memory_order_release);
+        source_thread_destroy(music_worker);
+        music_worker = nullptr;
+        stopping.store(false, std::memory_order_relaxed);
+        worker = StartDecoder(all_slots);
+    }
+    return worker != nullptr;
 }
 
 void StopAudioFileWorker() {
@@ -190,6 +226,10 @@ void StopAudioFileWorker() {
     stopping.store(true, std::memory_order_release);
     source_thread_destroy(worker);
     worker = nullptr;
+    if (music_worker) {
+        source_thread_destroy(music_worker);
+        music_worker = nullptr;
+    }
     for (auto& slot : slots) {
         slot.request = {};
         slot.state = AudioFileState::Idle;

@@ -32,7 +32,8 @@ struct Voice {
     std::size_t sample_at=0;
     bool Next(float* frame);
     void Begin();
-    void Mix(float* stereo,std::size_t frames,float gain=1);
+    // Output frames missed after playback starts because the file queue ran dry.
+    std::size_t Mix(float* stereo,std::size_t frames,float gain=1);
 };
 bool DecodeEffectBlock(const uint8* bytes,float* output,bool lookup);
 void MixEffects(float* stereo,std::size_t frames);

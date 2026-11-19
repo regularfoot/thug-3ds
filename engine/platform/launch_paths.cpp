@@ -14,6 +14,7 @@ namespace {
 std::string startup_save;
 bool skip_opening = false;
 bool performance_route = false;
+int trial_level = -1;
 bool hide_vancouver_ambient = true;
 bool compare_city_options = false;
 bool moscow_turn_trial = false;
@@ -36,6 +37,10 @@ void read_startup_options(const std::string& root) {
     moscow_turn_trial = performance_route && marker("compare_moscow_turn.txt");
     manhattan_turn = moscow_turn_trial && marker("compare_manhattan_night.txt");
     compare_stereo_turns = moscow_turn_trial && (manhattan_turn || marker("compare_moscow_night.txt"));
+    // The test save unlocks both classic levels in the regular Free Skate menu.
+    trial_level = compare_stereo_turns ? (manhattan_turn ? 1 : 7) : -1;
+    if (performance_route && marker("trial_school_ii.txt")) trial_level = 10;
+    if (performance_route && marker("trial_venice.txt")) trial_level = 11;
     compare_release_turn = moscow_turn_trial && marker("compare_moscow_release.txt");
     compare_city_options = performance_route && marker("compare_city_options.txt");
     reuse_static_prefix = !marker("exact_static_runs.txt");
@@ -77,6 +82,7 @@ bool UseOptimizedFramePath(unsigned step){
     constexpr bool abba[]={false,true,true,false,false,true,true,false,false,true,true,false};
     return abba[(step-1)/90];
 }
+int FreeSkateTrialLevel(){return trial_level;}
 bool ManhattanTurnTrial(){return manhattan_turn;}
 bool CompareStereoCityTurns(){return compare_stereo_turns;}
 bool MoscowTurnTrial(){return moscow_turn_trial;}

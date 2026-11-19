@@ -139,7 +139,8 @@ void StopSoundPlease(int which) {
     voices[which].playing=voices[which].prepared=false;voices[which].stream.reset();voices[which].disk_bytes.reset();voices[which].sample.reset();
 }
 void StopAllSoundFX() {
-    controller(); Pcm::StopMusic(); Pcm::StopStreams();
+    // Level scripts own the soundtrack and explicitly stop it at transitions.
+    controller(); Pcm::StopStreams();
     for (int i=0;i<NUM_VOICES;++i) StopSoundPlease(i);
 }
 bool VoiceIsOn(int which) { controller(); return which>=0 && which<NUM_VOICES && voices[which].playing; }

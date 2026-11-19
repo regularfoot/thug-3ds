@@ -12,6 +12,7 @@ bool CompareVancouverAmbient();
 bool CompareCityOptions();
 bool MoscowTurnTrial();
 bool CompareStereoCityTurns();
+int FreeSkateTrialLevel();
 bool ManhattanTurnTrial();
 bool UseOptimizedFramePath(unsigned step);
 enum TurnOption : unsigned { CacheAdmission=1, OpaqueGroups=2, AudioMix=4, SharedPose=8 };

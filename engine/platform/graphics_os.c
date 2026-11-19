@@ -229,6 +229,7 @@ static int use_index_sequence;
 void source_graphics_fast_index_commands(int enabled){use_index_sequence=enabled;}
 #ifdef __3DS__
 #include <3ds.h>
+#include <source_port/touch_controls.h>
 #include <citro3d.h>
 #include <world_shbin.h>
 #include <skin_shbin.h>
@@ -658,6 +659,35 @@ static void rollback(void) {
     if (gpu.texture_staging && !gpu.fence_error) linearFree(gpu.texture_staging);
     C3D_Fini(); gfxExit(); memset(&gpu,0,sizeof(gpu));
 }
+// Paint once into the lower LCD framebuffer. The top-screen GPU submission
+// path and the game loop do not need to draw the controls each frame.
+static void draw_touch_controls(void) {
+    u16* fb = (u16*)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
+    if (!fb) return;
+    const ConsoleFont* font = &consoleGetDefault()->font;
+    memset(fb, 0, SOURCE_TOUCH_WIDTH * SOURCE_TOUCH_HEIGHT * sizeof(*fb));
+    for (unsigned i = 0; i < SOURCE_TOUCH_ZONES; ++i) {
+        const SourceTouchZone* zone = &source_touch_zones[i];
+        const u16 color = zone->buttons ? RGB8_to_565(36, 55, 67) : RGB8_to_565(17, 26, 32);
+        for (int x = zone->x + 1; x < zone->x + zone->width - 1; ++x) {
+            for (int y = zone->y + 1; y < zone->y + zone->height - 1; ++y)
+                fb[x * SOURCE_TOUCH_HEIGHT + SOURCE_TOUCH_HEIGHT - 1 - y] = color;
+        }
+        int x = zone->x + (zone->width - (int)strlen(zone->label) * 16) / 2;
+        const int y = zone->y + (zone->height - 16) / 2;
+        for (const char* p = zone->label; *p; ++p, x += 16) {
+            const u8* glyph = font->gfx + ((unsigned char)*p - font->asciiOffset) * 8;
+            for (int row = 0; row < 16; ++row) {
+                for (int col = 0; col < 16; ++col) {
+                    if (glyph[row / 2] & (0x80 >> (col / 2)))
+                        fb[(x + col) * SOURCE_TOUCH_HEIGHT + SOURCE_TOUCH_HEIGHT - 1 - y - row] = 0xffff;
+                }
+            }
+        }
+    }
+    GSPGPU_FlushDataCache(fb, SOURCE_TOUCH_WIDTH * SOURCE_TOUCH_HEIGHT * sizeof(*fb));
+    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+}
 int source_graphics_open(void) {
     if (!controller()) return -1;
     if (gpu.open) { errno=EALREADY; return -1; }
@@ -703,6 +733,11 @@ int source_graphics_open(void) {
     gspSetEventCallback(GSPGPU_EVENT_P3D,draw_finished,&irq_count[DRAW_IRQ],false);
     gspSetEventCallback(GSPGPU_EVENT_PPF,gpu_irq,&irq_count[TRANSFER_IRQ],false);
     gspSetEventCallback(GSPGPU_EVENT_VBlank0,vblank,NULL,false);
+    if (source_application_os_is_old_3ds()) {
+        gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
+        gfxSetDoubleBuffering(GFX_BOTTOM, false);
+        draw_touch_controls();
+    }
     return 0;
 }
 static void release_blur(void){
@@ -769,8 +804,10 @@ static int capture_rgb(unsigned eye,uint8_t* rgb,size_t size){
 }
 int source_graphics_capture_rgb(uint8_t* rgb,size_t size){return capture_rgb(0,rgb,size);}
 void source_graphics_debug_text(const char* text){
-    if(!controller()||!gpu.open||!text)return;if(!gpu.console_ready){consoleInit(GFX_BOTTOM,NULL);gpu.console_ready=1;}printf("\x1b[2J\x1b[H%s",text);
-    u16 w,h;u8* fb=gfxGetFramebuffer(GFX_BOTTOM,GFX_LEFT,&w,&h);if(fb)GSPGPU_FlushDataCache(fb,(size_t)w*h*3);
+    if(!controller()||!gpu.open||!text)return;
+    if(!*text && source_application_os_is_old_3ds()){draw_touch_controls();return;}
+    if(!gpu.console_ready){consoleInit(GFX_BOTTOM,NULL);gpu.console_ready=1;}printf("\x1b[2J\x1b[H%s",text);
+    u16 w,h;u8* fb=gfxGetFramebuffer(GFX_BOTTOM,GFX_LEFT,&w,&h);if(fb)GSPGPU_FlushDataCache(fb,(size_t)w*h*sizeof(u16));
 }
 int source_graphics_stream_write_reserved(SourceGpuMesh** handle,size_t count,size_t index_count,size_t range_count,
                                          SourceStreamWriter write,void* context,SourceStreamCapacity* capacity){

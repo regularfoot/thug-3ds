@@ -211,16 +211,16 @@ void Voice::Begin() {
     playing=Next(a); if (!Next(b)) { b[0]=a[0]; b[1]=a[1]; ended=true; } else ended=false;
     prepared=playing;
 }
-void Voice::Mix(float* output,std::size_t frames,float gain) {
-    if (!playing || paused) return;
+std::size_t Voice::Mix(float* output,std::size_t frames,float gain) {
+    if (!playing || paused) return 0;
     if (file_slot>=0 && !primed) {
         const auto status=GetAudioFileStatus(file_slot);
         if (status.state==AudioFileState::Pending || status.state==AudioFileState::Opening ||
-            (status.state==AudioFileState::Ready && status.blocks<2)) return;
+            (status.state==AudioFileState::Ready && status.blocks<2)) return 0;
         rate=status.rate;
         Begin();
         primed=true;
-        if (!playing) return;
+        if (!playing) return 0;
     }
     const double step=double(rate)*pitch/(100.0*source_audio_rate());
     const float gain_left=left*gain,gain_right=right*gain;
@@ -240,7 +240,7 @@ void Voice::Mix(float* output,std::size_t frames,float gain) {
         }
         return true;
     };
-    if (!advance()) return;
+    if (!advance()) return starved ? frames : 0;
     // a and b are the lookahead immediately before the next source frame.
     // Inside a decoded block use a contiguous window. At refill, loop, EOF
     // or SD starvation the same advance() logic owns the phase and lookahead.
@@ -295,8 +295,9 @@ void Voice::Mix(float* output,std::size_t frames,float gain) {
             output+=2;
             --frames;
         }
-        if(!advance())return;
+        if(!advance())return starved ? frames : 0;
     }
+    return 0;
 }
 void VolumePair(Sfx::sVolume* volume,float& l,float& r) {
     if (!volume) { l=r=1; return; }

@@ -13,7 +13,7 @@ unsigned menu_test_frame = 0;
 unsigned char packet[32];
 void controller() { Dbg_Assert(source_thread_is_controller()); }
 unsigned char axis(int value, bool invert) {
-    // HID/IRRST signed axes are positive up/right, PS2 packet positive down/right.
+    // Clamp in int before negation so even the signed HID endpoints are safe.
     value = std::clamp(value, -156, 156);
     if (invert) value = -value;
     // Inp::Data retains the original radial/axial tolerance. Do not double it.
@@ -22,7 +22,7 @@ unsigned char axis(int value, bool invert) {
 }
 }
 namespace SourcePort {
-void BeginCityMenuTrial(){if(CompareStereoCityTurns())menu_test_frame=1;}
+void BeginCityMenuTrial(){if(FreeSkateTrialLevel()>=0)menu_test_frame=1;}
 void StartPerformanceRoute() { controller(); route_step = 0; route_active = true; }
 void StopPerformanceRoute() { controller(); route_active = false; route_step = 0; }
 unsigned PerformanceRouteStep() { return route_step; }
@@ -35,8 +35,10 @@ void EncodeInputPacket(const SourceInputSample& sample, unsigned char* out) {
     auto held = sample.connected ? sample.buttons : 0;
     out[2] = static_cast<unsigned char>(~(held >> 8));
     out[3] = static_cast<unsigned char>(~held);
-    out[4] = sample.connected ? axis(sample.right_x, false) : 128;
-    out[5] = sample.connected ? axis(sample.right_y, true) : 128;
+    // HID is positive up/right and PS2 is positive down/right. Reverse both
+    // camera axes relative to the original mapping, including touch look.
+    out[4] = sample.connected ? axis(sample.right_x, true) : 128;
+    out[5] = sample.connected ? axis(sample.right_y, false) : 128;
     out[6] = sample.connected ? axis(sample.left_x, false) : 128;
     out[7] = sample.connected ? axis(sample.left_y, true) : 128;
 }
@@ -65,13 +67,13 @@ void RefreshInput() {
     if(menu_test_frame && sample.connected){
         // Exercise Free Skate and its ordinary menu transitions from the test save.
         constexpr unsigned cross=1u<<6, down=1u<<14;
-        constexpr unsigned keys[]={down,cross,cross,cross,down,down,down,down,down,down,down,cross};
+        constexpr unsigned enter_free_skate[]={down,cross,cross,cross};
         const auto f=menu_test_frame++;
         if(f>=240){
             const auto step=(f-240)/36;
-            const auto confirm=ManhattanTurnTrial()?5u:11u;
+            const unsigned confirm=4u+unsigned(FreeSkateTrialLevel());
             if(step>confirm)menu_test_frame=0;
-            else if((f-240)%36<3)sample.buttons=step==confirm?cross:keys[step];
+            else if((f-240)%36<3)sample.buttons=step<4?enter_free_skate[step]:(step==confirm?cross:down);
         }
     }
     if (route_active && (sample.buttons & (1u << 11))) StopPerformanceRoute();
@@ -83,7 +85,8 @@ void RefreshInput() {
         sample.buttons = within < 145 ? 1u << 6 : 0;
         sample.left_x = (leg % 2 ? 1 : -1) * (within >= 70 && within < 114 ? 92 : 0);
         sample.left_y = 0;
-        sample.right_x = (leg % 2 ? -1 : 1) * (within >= 114 && within < 157 ? 100 : 0);
+        // Preserve the benchmark's recorded in-game camera direction.
+        sample.right_x = (leg % 2 ? 1 : -1) * (within >= 114 && within < 157 ? 100 : 0);
         sample.right_y = 0;
         if(MoscowTurnTrial()){
             sample.buttons=0; sample.left_x=sample.left_y=sample.right_x=sample.right_y=0;

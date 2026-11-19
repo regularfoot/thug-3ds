@@ -471,7 +471,7 @@ void CEngine::s_plat_render_world(){
                 sGetScene(Crc::GenerateCRCFromString("SE"))!=nullptr;
             if(local_model&&count==1&&SourcePort::PerformanceRouteEnabled()) {
                 if(local_arrays)renderer->benchmark_scene=moscow;
-                else for(const auto* name:{"NY","SC2","VC","SE"}) {
+                else for(const auto* name:{"NY","SC2","VN","VC","SE"}) {
                     const auto key=Crc::GenerateCRCFromString(name);
                     if(sGetScene(key)){renderer->benchmark_scene=key;break;}
                 }
@@ -713,7 +713,8 @@ void CEngine::s_plat_post_render(){
         SourcePort::Log("MOSCOW_GPU n=%u eyes=%u frame_elements_peak=%u list_count_peak=%u list_words_peak=%u list_draws_peak=%u list_elements_peak=%u",
             profile.frame,stereo>0?2:1,renderer->moscow_peak_geometry,renderer->moscow_peak_lists,
             renderer->moscow_peak_words,renderer->moscow_peak_draws,renderer->moscow_peak_elements);
-        SourcePort::RequestDiagnosticCheckpoint();
+        // Keep regular samples in the rolling RAM journal. A bulk append on
+        // the game's SD card can block soundtrack reads for several seconds.
     }
     if (renderer->profile.frame == 1) SourcePort::BootPhase("first_engine_frame");
     if (source_application_os_is_new_3ds() && renderer->profile.detail.local_parts &&
@@ -721,7 +722,6 @@ void CEngine::s_plat_post_render(){
         renderer->reported_local_frame=true;
         SourcePort::Log("LOCAL_SKATER_FIRST_FRAME n=%u parts=%u triangles=%u",renderer->profile.frame,
             renderer->profile.detail.local_parts,renderer->profile.detail.local_triangles);
-        SourcePort::RequestDiagnosticCheckpoint();
     }
 #endif
 #ifdef THUG_EXPORT_TEST_SAVE

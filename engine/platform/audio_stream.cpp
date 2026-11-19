@@ -1,6 +1,8 @@
 #include <core/defines.h>
 #include <gel/music/sdl/p_music.h>
 #include <source_port/audio.h>
+#include <source_port/audio_os.h>
+#include <source_port/diagnostics.h>
 #include <source_port/files.h>
 #include <source_port/thread_os.h>
 #include <sys/file/filesys.h>
@@ -15,6 +17,8 @@ struct Entry { std::string file; std::uint64_t offset=0,length=0; };
 std::map<uint32,Entry> songs,streams;
 std::string wad_file;
 SourcePort::Voice music,voices[NUM_STREAMS];
+std::uint64_t music_missing_frames=0, music_gap_frames=0, music_output_frames=0;
+unsigned music_report_frames=0;
 bool indexed=false;
 float music_volume=1;
 void controller() { Dbg_Assert(source_thread_is_controller()); }
@@ -27,6 +31,13 @@ uint32 music_key(const char* name){
     return *base?Crc::GenerateCRCFromString(base):0;
 }
 void clear(SourcePort::Voice& v) {
+    if (&v == &music) {
+        if (v.primed)
+            SourcePort::Log("MUSIC_BUFFER missing_frames=%llu output_rate=%u",
+                static_cast<unsigned long long>(music_missing_frames),source_audio_rate());
+        music_missing_frames=music_gap_frames=music_output_frames=0;
+        music_report_frames=0;
+    }
     if (v.file_slot>=0) SourcePort::CancelAudioFile(v.file_slot);
     v.file_slot=-1;
     v.prepared=v.playing=v.paused=v.ended=v.primed=v.starved=false;
@@ -94,7 +105,29 @@ void index() {
 }
 namespace SourcePort {
 void MixStreams(float* output,std::size_t frames) {
-    music.left=music.right=music_volume; music.Mix(output,frames);
+    music.left=music.right=music_volume;
+    const auto missing=music.Mix(output,frames);
+    music_missing_frames+=missing;
+    // A partially mixed block includes real music before a new gap. A paused
+    // voice cannot establish that playback has resumed.
+    if (music.playing && !music.paused && missing<frames && music_gap_frames) {
+        const auto rate=source_audio_rate();
+        if (music_gap_frames>=rate/4)
+            Log("MUSIC_BUFFER resumed_after_ms=%llu",static_cast<unsigned long long>(music_gap_frames*1000/rate));
+        music_gap_frames=0;
+    }
+    music_gap_frames+=missing;
+    if (music.primed && music.playing && !music.paused) {
+        music_output_frames+=frames;
+        music_report_frames+=frames;
+        const auto rate=source_audio_rate();
+        if (music_report_frames>=12*rate) {
+            Log("MUSIC_BUFFER output_frames=%llu missing_frames=%llu output_rate=%u",
+                static_cast<unsigned long long>(music_output_frames),
+                static_cast<unsigned long long>(music_missing_frames),rate);
+            music_report_frames%=12*rate;
+        }
+    }
     for (auto& voice:voices) voice.Mix(output,frames,Sfx::gSfxVolume*0.01f);
 }
 void StopNativeStreams() { controller(); clear(music); for (auto& v:voices) clear(v); }
@@ -138,7 +171,11 @@ bool PCMAudio_PlayStream(uint32 key,int which,Sfx::sVolume* volume,float pitch,b
 bool PCMAudio_StartStream(int which) {
     controller(); return slot(which) && start(voices[which]);
 }
-void PCMAudio_StopMusic(bool) { controller(); clear(music); }
+void PCMAudio_StopMusic(bool) {
+    controller();
+    if (music.playing) SourcePort::Log("MUSIC_STOP requested=1");
+    clear(music);
+}
 void PCMAudio_StopStream(int which,bool) { controller(); if (slot(which)) clear(voices[which]); }
 void PCMAudio_StopStreams() { controller(); for (auto& v:voices) clear(v); }
 int PCMAudio_GetMusicStatus() { controller(); return music.playing ? PCM_STATUS_PLAYING : PCM_STATUS_FREE; }

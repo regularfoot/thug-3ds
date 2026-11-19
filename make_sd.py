@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import struct
@@ -12,7 +13,12 @@ import tempfile
 from tools.pack_npc_resources import pack
 
 ROOT = Path(__file__).resolve().parent
-APP = 'thug1_source_engine_0309'
+BUILD_ID_HEADER = ROOT / 'engine/platform/source_port/build_id.h'
+build_id = re.search(r'^#define THUG_SOURCE_BUILD "([0-9]{4})"$',
+                     BUILD_ID_HEADER.read_text(), re.MULTILINE)
+if build_id is None:
+    raise ValueError(f'Missing four-digit build number in {BUILD_ID_HEADER}')
+APP = 'thug1_source_engine_' + build_id.group(1)
 
 def sha(path):
     with path.open('rb') as stream:
