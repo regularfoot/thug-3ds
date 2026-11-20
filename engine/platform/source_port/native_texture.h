@@ -2,6 +2,7 @@
 #include <source_port/texture_cache.h>
 #include <source_port/graphics_os.h>
 #include <gfx/nxtexture.h>
+namespace SourcePort { uint64 WorldTextureGeneration(); }
 namespace Nx {
 class CNativeTexture final:public CTexture {
 public:

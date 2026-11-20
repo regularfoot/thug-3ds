@@ -11,6 +11,10 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+uint64_t source_graphics_overlap_ticks(uint64_t phase,uint64_t join,uint64_t irq){
+    const uint64_t end=join<irq?join:irq;
+    return phase && end>phase?end-phase:0;
+}
 static int input_capture_probe,single_draw_requested;
 void source_graphics_probe_inputs(int enabled){input_capture_probe=enabled!=0;}
 void source_graphics_single_draw(int enabled){single_draw_requested=enabled!=0;}
@@ -19,6 +23,16 @@ static size_t resource_lower_bound(const SourceResourceIndex* index,uintptr_t ke
 }
 int source_resource_index_contains(const SourceResourceIndex* index,const void* value){
     if(!index||!value)return 0;size_t at=resource_lower_bound(index,(uintptr_t)value);return at<index->count&&index->keys[at]==(uintptr_t)value;
+}
+static unsigned handle_slot(uintptr_t key){return ((key>>4)^(key>>13))&255u;}
+int source_resource_index_cached(SourceResourceIndex* index,const void* value){
+    if(!index||!value)return 0;
+    const uintptr_t key=(uintptr_t)value;
+    uintptr_t* slot=&index->recent[handle_slot(key)];
+    if(*slot==key)return 1;
+    if(!source_resource_index_contains(index,value))return 0;
+    *slot=key;
+    return 1;
 }
 int source_resource_index_insert(SourceResourceIndex* index,const void* value){
     if(!index||!value){errno=EINVAL;return -1;}size_t at=resource_lower_bound(index,(uintptr_t)value);
@@ -31,6 +45,7 @@ int source_resource_index_insert(SourceResourceIndex* index,const void* value){
 int source_resource_index_remove(SourceResourceIndex* index,const void* value){
     if(!index||!value){errno=EINVAL;return -1;}size_t at=resource_lower_bound(index,(uintptr_t)value);
     if(at==index->count||index->keys[at]!=(uintptr_t)value){errno=ENOENT;return -1;}
+    index->recent[handle_slot((uintptr_t)value)]=0;
     memmove(index->keys+at,index->keys+at+1,(index->count-at-1)*sizeof(uintptr_t));--index->count;return 0;
 }
 void source_resource_index_close(SourceResourceIndex* index){if(index){free(index->keys);memset(index,0,sizeof(*index));}}
@@ -63,7 +78,7 @@ int source_graphics_validate_index_ranges(size_t vertices,const uint16_t* indice
     for(size_t i=0;i<range_count;++i){const SourceIndexRange* r=&ranges[i];
         if(!r->vertex_count||r->vertex_count>65536||r->vertex_first%4||r->vertex_first>vertices||r->vertex_count>vertices-r->vertex_first
            ||r->vertex_base%4||r->vertex_base>r->vertex_first
-           ||!r->index_count||r->index_count%3||r->index_first%8||r->index_first<end||r->index_first>count||r->index_count>count-r->index_first){errno=EINVAL;return -1;}
+           ||r->triangle_strip>1||r->index_count<3||(r->triangle_strip ? r->index_count>SOURCE_DRAW_SLICE_ELEMENTS : r->index_count%3)||r->index_first%8||r->index_first<end||r->index_first>count||r->index_count>count-r->index_first){errno=EINVAL;return -1;}
         const size_t first=r->vertex_first-r->vertex_base;
         if(first>65536-r->vertex_count){errno=EINVAL;return -1;}
         end=(size_t)r->index_first+r->index_count;
@@ -225,7 +240,10 @@ int source_graphics_fog_lut(float near_clip,float far_clip,float start,unsigned 
         if(k<128)out[k]=value;if(k)out[k+127]=value-previous;previous=value;
     }return 0;
 }
-static int use_index_sequence;
+static int use_index_sequence,fast_city_cpu,measure_command_cpu;
+static uint64_t command_ticks;
+void source_graphics_city_cpu(int fast,int measure){fast_city_cpu=fast;measure_command_cpu=measure;}
+uint64_t source_graphics_command_ticks(void){return command_ticks;}
 void source_graphics_fast_index_commands(int enabled){use_index_sequence=enabled;}
 #ifdef __3DS__
 #include <3ds.h>
@@ -250,7 +268,7 @@ typedef struct SourceGpuInputDraw {
     const uint16_t* indices;
     C3D_Tex texture;
     unsigned packet, first, elements, vertex_first, vertex_count, index_first, vertex_base;
-    uint8_t eye, texture_owner, clip_owner, orthographic, depth_write, alpha_cutoff, cull;
+    uint8_t eye, texture_owner, clip_owner, orthographic, depth_write, alpha_cutoff, cull, strip;
     C3D_Mtx clip;
 } SourceGpuInputDraw;
 enum { FILL_IRQ, DRAW_IRQ, TRANSFER_IRQ, VBLANK_IRQ, IRQ_COUNT };
@@ -266,6 +284,10 @@ static struct {
     bool skin_tried,skin_ready;
     bool early_open,early_joined,bounded_list;
     float early_stereo;
+    unsigned next_present_tag, pending_eyes;
+    bool defer_next_present;
+    SourcePresentSample presenting, presented[4];
+    uint64_t returned_tick, next_cpu_tick, next_geometry_tick;
     C3D_Tex white, sampler;
     int white_ready,console_ready;
     C3D_FogLut fog;
@@ -392,7 +414,8 @@ void __wrap_GPUCMD_Add(u32 header,const u32* parameters,u32 count) {
         ++gpu.framebuffer_barriers;
     }
     if(count==1)emit_register(header,value);
-    else __real_GPUCMD_Add(header,parameters,count);
+    else if(!fast_city_cpu || !source_pica_append_short_run(gpuCmdBuf,gpuCmdBufSize,&gpuCmdBufOffset,header,parameters,count))
+        __real_GPUCMD_Add(header,parameters,count);
 }
 Result __wrap_GX_ProcessCommandList(u32* buffer,u32 bytes,u8 flags) {
     if(!(flags&GX_CMDLIST_FLUSH))return __real_GX_ProcessCommandList(buffer,bytes,flags);
@@ -430,7 +453,9 @@ static int capture_bytes(FILE* file,const void* data,size_t bytes) {
 static int capture_inputs(FILE* file,void* unused) {
     (void)unused;
     // All words are little-endian u32, followed by 16 clip-matrix floats.
-    const uint32_t header[4]={0x50474854,1,gpu.submitted.serial,gpu.input_count};
+    unsigned version=1;
+    for(unsigned i=0;i<gpu.input_count;++i)if(gpu.input_draws[i].strip)version=2;
+    const uint32_t header[4]={0x50474854,version,gpu.submitted.serial,gpu.input_count};
     if(capture_bytes(file,header,sizeof(header)))return -1;
     for(unsigned i=0;i<gpu.input_count;++i){
         const SourceGpuInputDraw* draw=&gpu.input_draws[i];
@@ -440,7 +465,7 @@ static int capture_inputs(FILE* file,void* unused) {
         // Keep THGP v1 byte-compatible. Address conversion and sizing are
         // needed only for an explicit capture or a failed fence.
         unsigned m[24]={
-            draw->packet,draw->eye,draw->indices!=NULL,draw->first,draw->elements,
+            draw->packet,draw->eye,draw->strip?2u:(draw->indices!=NULL),draw->first,draw->elements,
             draw->vertex_first,draw->vertex_count,draw->index_first,draw->indices?draw->elements:0,
             osConvertVirtToPhys(mesh->vertices+draw->vertex_base),
             draw->indices?osConvertVirtToPhys(draw->indices):0,osConvertVirtToPhys(texture->data),
@@ -533,6 +558,7 @@ static int acquire(const char* waiter) {
     if (!controller() || !gpu.open) { errno=ENODEV; return -1; }
     if(gpu.fence_error){errno=gpu.fence_error;return -1;}
     if (!gpu.acquired) {
+        if(gpu.pending_eyes && source_graphics_drain_present())return -1;
         if(wait_for_draw(waiter))return -1;
         if (!C3D_FrameBegin(C3D_FRAME_NONBLOCK)){errno=EIO;return -1;}
         gpu.input_count=gpu.segment_saved_words=0;
@@ -579,9 +605,20 @@ static int transfer(const char* waiter,C3D_RenderTarget* target,u32* output,u32 
     return wait_for_irq(waiter,TRANSFER_IRQ);
 }
 
-static int present(unsigned eyes){
-    finish();
+static int complete_present(unsigned eyes){
+    const uint64_t join=source_clock_now();
     if(wait_for_draw(__func__))return -1;
+    SourcePresentSample* sample=&gpu.presenting;
+    if(sample->tag && gpu.submitted.draw){
+        const unsigned delta=__atomic_load_n(&draw_finished_tick,__ATOMIC_RELAXED)-(unsigned)gpu.submitted_at;
+        const uint64_t irq=gpu.submitted_at+delta;
+        sample->cpu_overlap=source_graphics_overlap_ticks(gpu.next_cpu_tick,join,irq);
+        sample->geometry_overlap=source_graphics_overlap_ticks(gpu.next_geometry_tick,join,irq);
+        sample->draw_tail=source_graphics_overlap_ticks(gpu.returned_tick,irq,irq);
+        sample->hold_after_draw=sample->deferred&&join>irq?join-irq:0;
+        sample->next_cpu_started=gpu.next_cpu_tick!=0;
+        sample->next_geometry_started=gpu.next_geometry_tick!=0;
+    }
     gpu.gpu_complete_frame_us=gpu.draw_segment_us+gpu.gpu_previous_draw_us;
     // gfxGetFramebuffer follows the CPU-side swap index immediately. GSP
     // applies that swap at VBlank; until then the next destination may
@@ -607,6 +644,49 @@ static int present(unsigned eyes){
         if(transfer(__func__,gpu.target[eye],output,flags))return -1;
     }
     gfxScreenSwapBuffers(GFX_TOP,eyes==2);
+    if(sample->tag){
+        sample->swap_tick=source_clock_now();
+        gpu.presented[sample->tag%4]=*sample;
+    }
+    return 0;
+}
+void source_graphics_next_present(unsigned tag,int defer){
+    gpu.next_present_tag=tag;
+    gpu.defer_next_present=defer!=0;
+}
+int source_graphics_present_sample(unsigned tag,SourcePresentSample* out){
+    if(!tag||gpu.presented[tag%4].tag!=tag)return 0;
+    *out=gpu.presented[tag%4];
+    return 1;
+}
+int source_graphics_drain_present(void){
+    if(!gpu.pending_eyes)return 0;
+    if(gpu.fence_error){errno=gpu.fence_error;return -1;}
+    // complete_present uses direct GX transfers only; it never reacquires
+    // Citro3D or resets the previous frame's diagnostic snapshot.
+    if(complete_present(gpu.pending_eyes))return -1;
+    gpu.pending_eyes=0;
+    return 0;
+}
+int source_graphics_overlap_phase(int geometry){
+    if(!gpu.pending_eyes)return 0;
+    uint64_t* tick=geometry?&gpu.next_geometry_tick:&gpu.next_cpu_tick;
+    if(!*tick)*tick=source_clock_now();
+    // Present a finished picture promptly instead of waiting for a subsequent
+    // upload. If still drawing, allow CPU-only game and scene work to continue.
+    if(irq_snapshot(DRAW_IRQ)!=gpu.irq_start[DRAW_IRQ])return source_graphics_drain_present();
+    return 0;
+}
+static int present(unsigned eyes){
+    finish();
+    gpu.presenting=(SourcePresentSample){.tag=gpu.next_present_tag,.draws=gpu.draw_calls};
+    const bool defer=gpu.defer_next_present&&eyes==2&&!gpu.blur&&gpu.submitted.draw;
+    gpu.next_present_tag=0;gpu.defer_next_present=false;
+    gpu.next_cpu_tick=gpu.next_geometry_tick=gpu.returned_tick=0;
+    if(!defer)return complete_present(eyes);
+    gpu.pending_eyes=eyes;
+    gpu.presenting.deferred=1;
+    gpu.returned_tick=source_clock_now();
     return 0;
 }
 
@@ -624,7 +704,9 @@ static int clear_target(C3D_RenderTarget* target,C3D_ClearBits bits,u32 color){
 }
 
 static int command_room(C3D_RenderTarget* active,unsigned next_elements,int boundary) {
-    u32 size,offset;GPUCMD_GetBuffer(NULL,&size,&offset);
+    u32 size,offset;
+    if(fast_city_cpu){size=gpuCmdBufSize;offset=gpuCmdBufOffset;}
+    else GPUCMD_GetBuffer(NULL,&size,&offset);
     // Command size alone does not bound PICA work. A short indexed command
     // can submit thousands of triangles. Preserve the render target while
     // fencing by both list size and vertex/index count.
@@ -759,7 +841,8 @@ int source_graphics_close(void) {
 }
 int source_graphics_wait(void) { return acquire(__func__); }
 void source_graphics_reset_frame_timing(void){
-    gpu.wait_ticks=0;gpu.gpu_previous_draw_us=0;gpu.eyes=0;
+    command_ticks=0;gpu.wait_ticks=0;gpu.gpu_previous_draw_us=0;
+    if(!gpu.pending_eyes)gpu.eyes=0;
     gpu.fill_ticks=gpu.draw_ticks=gpu.transfer_ticks=gpu.swap_ticks=0;
     gpu.vertex_bindings=gpu.local_vertex_bindings=gpu.compact_binds=0;
     gpu.draw_calls=gpu.planned_packets=gpu.clip_updates=0;
@@ -971,6 +1054,7 @@ int source_graphics_skin_pose(SourceGpuMesh* mesh,const float* rows,unsigned bon
                 if(influence[i].rows[s]>=bones*3||influence[i].rows[s]%3||
                    !isfinite(influence[i].weights[s]))return -1;
     }else if(mesh->skin->bones!=bones)return -1;
+    if(gpu.pending_eyes && source_graphics_drain_present())return -1;
     memcpy(mesh->skin->rows,rows,bones*12*sizeof(float));
     mesh->skin->bones=bones;
     return 0;
@@ -1103,14 +1187,15 @@ static void bind_sampler(const C3D_Tex* texture,GPU_TEXTURE_WRAP_PARAM u,GPU_TEX
 static int packet_valid(const SourceDrawPacket* p,const SourceDrawPacket* previous,unsigned changes) {
     // Consecutive draws often share the streaming arena or a material.
     // Every distinct handle still passes the registry before dereferencing.
-    if(((!previous||p->mesh!=previous->mesh)&&!mesh_live(p->mesh))||
-       (p->texture&&(!previous||p->texture!=previous->texture)&&!texture_live(p->texture))||
-       !p->count||p->count%3||p->first>p->mesh->used)return 0;
+    if(((!previous||p->mesh!=previous->mesh)&&!(fast_city_cpu?source_resource_index_cached(&gpu.mesh_index,p->mesh):mesh_live(p->mesh)))||
+       (p->texture&&(!previous||p->texture!=previous->texture)&&!(fast_city_cpu?source_resource_index_cached(&gpu.texture_index,p->texture):texture_live(p->texture)))||
+       !p->count||p->first>p->mesh->used)return 0;
     if(p->index_range){if(p->index_range>p->mesh->range_count)return 0;const SourceIndexRange* r=&p->mesh->ranges[p->index_range-1];
         // A visible prefix of an immutable run starts at the very same validated
         // index address and uses the same vertex base. No page or index rebasing.
-        if(p->first!=r->vertex_first||p->count>r->index_count)return 0;
-    }else if(p->count>p->mesh->used-p->first)return 0;
+        if(p->first!=r->vertex_first||p->count>r->index_count||
+           (r->triangle_strip ? p->count!=r->index_count : p->count%3))return 0;
+    }else if(p->count%3||p->count>p->mesh->used-p->first)return 0;
     if (!p->width||!p->height||p->x>=400||p->y>=240||p->width>400-p->x||p->height>240-p->y||p->blend>SOURCE_BLEND_ADD||p->depth_write>1||p->cull>1||p->alpha_cutoff>255) return 0;
     if (p->orthographic>1||p->ui_depth>1||p->clip_enabled>1||p->modulate_2x>1||p->alpha_2x>1||p->original_blend>1||p->nearest>1||p->u_address>2||p->v_address>2||!isfinite(p->z_bias)) return 0;
     if(p->fog_enabled>1||p->fog_alpha>255||!isfinite(p->fog_start))return 0;
@@ -1191,7 +1276,7 @@ fail:finish();free(current);free(tiled);return -1;
 }
 float source_graphics_slider(void){if(!controller()||!gpu.open){errno=ENODEV;return NAN;}return source_stereo_slider(osGet3DSliderState());}
 int source_graphics_submit(const SourceDrawPacket* packets,size_t count,uint32_t clear,float stereo){return source_graphics_submit_frame(packets,count,clear,stereo,1);}
-static int validate_packets(const SourceDrawPacket* packets,size_t count,float stereo) {
+static int validate_packet_range(const SourceDrawPacket* packets,size_t count,float stereo) {
     if ((!packets&&count)||count>65536||!isfinite(stereo)||stereo<0||stereo>1) { errno=EINVAL;return -1; }
     if (!controller()||!gpu.open) { errno=ENODEV;return -1; }
     if(count>gpu.transition_capacity){
@@ -1272,11 +1357,11 @@ static bool sdk_indexed_sequence(u32 start,u32 address,unsigned count){
     }
     return true;
 }
-static bool emit_indexed_sequence(u32 address,unsigned count){
+static bool emit_indexed_sequence(u32 address,unsigned count,bool clean_context){
     enum { words=sizeof(indexed_triangles)/sizeof(u32) };
     // This emits all deferred texture, matrix, palette and framebuffer state
     // through the same barrier hook as the ordinary SDK draw.
-    C3Di_UpdateContext();
+    if(!clean_context)C3Di_UpdateContext();
     if(gpuCmdBufOffset>gpuCmdBufSize||gpuCmdBufSize-gpuCmdBufOffset<words)return false;
     u32* output=gpuCmdBuf+gpuCmdBufOffset;
     memcpy(output,indexed_triangles,sizeof(indexed_triangles));
@@ -1333,7 +1418,7 @@ void __real_C3D_UpdateUniforms(GPU_SHADER_TYPE type);
 void __wrap_C3D_UpdateUniforms(GPU_SHADER_TYPE type){
     if(!(clean_uniform_stages & (1u<<type)))__real_C3D_UpdateUniforms(type);
 }
-static int encode_packets(const SourceDrawPacket* packets,size_t count,float stereo) {
+static int encode_packet_range(const SourceDrawPacket* packets,size_t count,float stereo) {
     // Replay only immutable draw data. Neither QB nor physics runs per eye.
     for (unsigned eye=0;eye<(stereo>0?2u:1u);++eye) {
         const SourceDrawPacket* fog_state=NULL;
@@ -1458,6 +1543,7 @@ static int encode_packets(const SourceDrawPacket* packets,size_t count,float ste
             }
             const unsigned base=range?range->vertex_base:indexed_array?array.vertex_base:0;
             const SourceRenderVertex* vertex_base=p->mesh->vertices+base;
+            const bool already_bound=vertex_base==bound_vertices;
             bool offset_only=false;
             if(vertex_base!=bound_vertices){
                 ++gpu.vertex_bindings;
@@ -1507,6 +1593,7 @@ static int encode_packets(const SourceDrawPacket* packets,size_t count,float ste
             input->texture_owner=texture_owner;
             input->clip_owner=clip_owner;
             input->packet=gpu.segment_last;
+            input->strip=range&&range->triangle_strip;
             input->eye=eye;
             input->first=draw_indices?base:p->first+(unsigned)drawn;
             input->elements=slice;
@@ -1535,12 +1622,18 @@ static int encode_packets(const SourceDrawPacket* packets,size_t count,float ste
             }
             if(draw_indices){
                 ++gpu.segment_indexed;
-                if(use_index_sequence&&!single_draw_requested){
+                if(range&&range->triangle_strip){
+                    C3D_DrawElements(GPU_TRIANGLE_STRIP,slice,C3D_UNSIGNED_SHORT,draw_indices);
+                }else if(use_index_sequence&&!single_draw_requested){
                     const u32 pa=range?p->mesh->index_paddr+(range->index_first+drawn)*sizeof(*draw_indices):
                         gpu.array_index_paddr+array.index_variant*SOURCE_DRAW_SLICE_ELEMENTS*sizeof(*draw_indices);
                     if(pa<vertex_window){effects_packet=NULL;clean_uniform_stages=0;finish();errno=EINVAL;return -1;}
                     const u32 address=(pa-vertex_window)|0x80000000u;
-                    if(!sequence_ready||!emit_indexed_sequence(address,slice)){
+                    // The previous SDK update already committed every register for
+                    // this flat draw. A new eye/list always has a full transition.
+                    const bool clean=fast_city_cpu && !changes && !skin && !program_changed && already_bound &&
+                        fog_mode==0 && raster_state && (!raster_state->fog_enabled || raster_state->orthographic);
+                    if(!sequence_ready||!emit_indexed_sequence(address,slice,clean)){
                         const u32 before=gpuCmdBufOffset;
                         C3D_DrawElements(GPU_TRIANGLES,slice,C3D_UNSIGNED_SHORT,draw_indices);
                         sequence_ready=sdk_indexed_sequence(before,address,slice);
@@ -1555,6 +1648,20 @@ static int encode_packets(const SourceDrawPacket* packets,size_t count,float ste
         }
     }
     return 0;
+}
+static int validate_packets(const SourceDrawPacket* packets,size_t count,float stereo){
+    if(!measure_command_cpu)return validate_packet_range(packets,count,stereo);
+    const uint64_t start=source_clock_now();
+    const int result=validate_packet_range(packets,count,stereo);
+    command_ticks+=source_clock_now()-start;
+    return result;
+}
+static int encode_packets(const SourceDrawPacket* packets,size_t count,float stereo){
+    if(!measure_command_cpu)return encode_packet_range(packets,count,stereo);
+    const uint64_t start=source_clock_now(),wait=gpu.wait_ticks;
+    const int result=encode_packet_range(packets,count,stereo);
+    command_ticks+=source_clock_now()-start-(gpu.wait_ticks-wait);
+    return result;
 }
 int source_graphics_submit_frame(const SourceDrawPacket* packets,size_t count,uint32_t clear,float stereo,int clear_color) {
     if(gpu.early_open){errno=EBUSY;return -1;}
@@ -1613,6 +1720,10 @@ void source_graphics_fatal(const char* text) {
 int source_graphics_open(void) { errno=ENOTSUP;return -1; }
 int source_graphics_close(void) { errno=ENOTSUP;return -1; }
 int source_graphics_wait(void) { errno=ENOTSUP;return -1; }
+void source_graphics_next_present(unsigned tag,int defer){(void)tag;(void)defer;}
+int source_graphics_overlap_phase(int geometry){(void)geometry;return 0;}
+int source_graphics_drain_present(void){return 0;}
+int source_graphics_present_sample(unsigned tag,SourcePresentSample* out){(void)tag;(void)out;return 0;}
 int source_graphics_set_blur(unsigned a){(void)a;errno=ENOTSUP;return -1;}
 size_t source_graphics_linear_free(void){return 0;}
 int source_graphics_stats(SourceGraphicsStats* p){(void)p;errno=ENOTSUP;return -1;}

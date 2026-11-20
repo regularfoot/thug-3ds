@@ -134,6 +134,30 @@ void SimplifyGameplaySkin(const SectorAsset& sector,RenderTopology& topology){
     compact.weights=topology.weights;
     if(CompactRenderTopology(sector,indices,compact))topology=std::move(compact);
 }
+// Check the exact triangle sequence and winding against the final compact mesh.
+std::vector<uint16> CompactSourceStrip(const std::vector<uint16>& strip, const std::vector<uint16>& vertices,
+                                      const std::vector<uint16>& triangles) {
+    if(strip.size()<3 || strip.size()>=triangles.size() || vertices.empty())return {};
+    const unsigned limit=*std::max_element(vertices.begin(),vertices.end());
+    std::vector<int> remap(limit+1,-1);
+    for(unsigned i=0;i<vertices.size();++i)remap[vertices[i]]=int(i);
+    std::vector<uint16> compact;
+    compact.reserve(strip.size());
+    size_t cursor=0;
+    for(uint16 src:strip){
+        if(src>limit || remap[src]<0)return {};
+        compact.push_back(uint16(remap[src]));
+        const size_t n=compact.size();
+        if(n<3)continue;
+        auto a=compact[n-3],b=compact[n-2],c=compact[n-1];
+        if(a==b||b==c||a==c)continue;
+        if(!(n&1))std::swap(a,b);
+        if(cursor+3>triangles.size() || triangles[cursor]!=a || triangles[cursor+1]!=b || triangles[cursor+2]!=c)return {};
+        cursor+=3;
+    }
+    if(cursor!=triangles.size())return {};
+    return compact;
+}
 bool BuildDistantRenderTopology(const SectorAsset& sector, const MeshAsset& mesh, RenderTopology& out) {
     RenderTopology result;
     if (mesh.distant_triangles.empty() ||

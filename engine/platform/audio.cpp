@@ -1,4 +1,5 @@
 #include <limits>
+#include <type_traits>
 #include <cstring>
 #include <core/defines.h>
 #include <source_port/audio.h>
@@ -34,15 +35,17 @@ constexpr std::array<int,89> ima_step{
     5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,
     13899,15289,16818,18500,20350,22385,24623,27086,29794,32767};
 constexpr std::array<int,8> ima_index{-1,-1,-1,-1,2,4,6,8};
-// A magnitude needs 16 bits at index 88. The upper byte stores the next
-// index so that each decoded nibble costs one lookup on ARM11.
+// Include the sign and the next row offset. The largest delta needs
+// more than 16 signed bits.
+struct ImaTransition { int delta; unsigned next_row; };
 constexpr auto ima_transitions=[]{
-    std::array<std::array<uint32,8>,89> table{};
+    std::array<ImaTransition,89*16> table{};
     for(int index=0;index<89;++index){
-        for(int m=0;m<8;++m){
+        for(unsigned code=0;code<16;++code){
+            const int m=code&7;
             const auto delta=(ima_step[index]*(2*m+1))>>3;
             const auto next=std::clamp(index+ima_index[m],0,88);
-            table[index][m]=uint32(delta)|(uint32(next)<<16);
+            table[16*index+code]={code&8?-delta:delta,unsigned(next)*16};
         }
     }
     return table;
@@ -61,19 +64,27 @@ bool decode_xbox_ima(const uint8* bytes,float* output) {
         output[frame*2]=output[frame*2+1]=float(pcm)/32768.f;
     };
     emit(0);
-    for (unsigned i=0;i<64;++i) {
-        const unsigned code=(bytes[4+i/2]>>(4*(i&1)))&15, magnitude=code&7;
-        int delta;
-        if constexpr(lookup){
-            const auto transition=ima_transitions[index][magnitude];
-            index=int(transition>>16);
-            delta=int(transition&0xffff);
-        }else{
-            delta=(ima_step[index]*int(2*magnitude+1))>>3;
-            index=std::clamp(index+ima_index[magnitude],0,88);
+    if constexpr(lookup){
+        unsigned row=unsigned(index)*16;
+        auto decode=[&](unsigned code,unsigned frame){
+            const auto transition=ima_transitions[row+code];
+            row=transition.next_row;
+            predictor=std::clamp(predictor+transition.delta,-32768,32767);
+            emit(frame);
+        };
+        for(unsigned i=0;i<32;++i){
+            const unsigned codes=bytes[4+i];
+            decode(codes&15,2*i+1);
+            decode(codes>>4,2*i+2);
         }
-        predictor=std::clamp(predictor+((code&8)?-delta:delta),-32768,32767);
-        emit(i+1);
+    }else{
+        for(unsigned i=0;i<64;++i){
+            const unsigned code=(bytes[4+i/2]>>(4*(i&1)))&15, magnitude=code&7;
+            const int delta=(ima_step[index]*int(2*magnitude+1))>>3;
+            index=std::clamp(index+ima_index[magnitude],0,88);
+            predictor=std::clamp(predictor+((code&8)?-delta:delta),-32768,32767);
+            emit(i+1);
+        }
     }
     return true;
 }
@@ -246,7 +257,7 @@ std::size_t Voice::Mix(float* output,std::size_t frames,float gain) {
     // or SD starvation the same advance() logic owns the phase and lookahead.
     const bool direct=step==1 && phase==0;
     const bool mono=sample&&!sample->disk&&sample->encoded.empty();
-    auto mix_window=[&](auto frame,std::size_t& cursor,std::size_t end){
+    auto mix_window=[&](auto frame,std::size_t& cursor,std::size_t end,auto mono_input){
         const auto first=cursor;
         const auto available=end-cursor;
         std::size_t used=0;
@@ -261,19 +272,26 @@ std::size_t Voice::Mix(float* output,std::size_t frames,float gain) {
             output+=2*used;
         }else{
             auto left_frame=frame(first-2),right_frame=frame(first-1);
+            double position=phase;
             while(frames && used<available){
-                const auto fraction=float(phase);
-                output[0]+=(left_frame[0]+(right_frame[0]-left_frame[0])*fraction)*gain_left;
-                output[1]+=(left_frame[1]+(right_frame[1]-left_frame[1])*fraction)*gain_right;
+                const auto fraction=float(position);
+                const float left_value=left_frame[0]+(right_frame[0]-left_frame[0])*fraction;
+                output[0]+=left_value*gain_left;
+                if constexpr(decltype(mono_input)::value){
+                    output[1]+=left_value*gain_right;
+                }else{
+                    output[1]+=(left_frame[1]+(right_frame[1]-left_frame[1])*fraction)*gain_right;
+                }
                 --frames;
                 output+=2;
-                phase+=step;
-                while(phase>=1 && used<available){
+                position+=step;
+                while(position>=1 && used<available){
                     left_frame=right_frame;
                     right_frame=frame(first+used++);
-                    phase-=1;
+                    position-=1;
                 }
             }
+            phase=position;
         }
         cursor+=used;
         const auto previous=frame(cursor-2),next=frame(cursor-1);
@@ -282,11 +300,18 @@ std::size_t Voice::Mix(float* output,std::size_t frames,float gain) {
     };
     while(frames){
         if(block_at>=2 && block_at<block_frames){
-            mix_window([&](std::size_t at){return std::array<float,2>{block[2*at],block[2*at+1]};},
-                       block_at,block_frames);
+            // Effect decoders produce mono in both lanes. File streams can
+            // carry distinct channels and keep the stereo interpolation.
+            if(sample && file_slot<0){
+                mix_window([&](std::size_t at){const float v=block[2*at];return std::array<float,2>{v,v};},
+                           block_at,block_frames,std::true_type{});
+            }else{
+                mix_window([&](std::size_t at){return std::array<float,2>{block[2*at],block[2*at+1]};},
+                           block_at,block_frames,std::false_type{});
+            }
         }else if(mono && sample_at>=2 && sample_at<sample->mono.size()){
             mix_window([&](std::size_t at){const float v=sample->mono[at]/32768.f;return std::array<float,2>{v,v};},
-                       sample_at,sample->mono.size());
+                       sample_at,sample->mono.size(),std::true_type{});
         }else{
             const float fraction=float(phase);
             output[0]+=(direct?a[0]:a[0]+(b[0]-a[0])*fraction)*gain_left;

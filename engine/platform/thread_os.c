@@ -171,3 +171,114 @@ void source_thread_sleep_ms(unsigned milliseconds) {
     while (nanosleep(&remaining, &remaining) && errno == EINTR) {}
 #endif
 }
+
+/* Single in-flight CPU job. The controller keeps inputs and scratch alive until wait.
+ * No engine allocators, ownership changes or graphics calls run on this worker. */
+#ifdef __3DS__
+typedef LightEvent FrameEvent;
+static int frame_event_init(FrameEvent* e) { LightEvent_Init(e, RESET_ONESHOT); return 0; }
+static void frame_signal(FrameEvent* e) { LightEvent_Signal(e); }
+static void frame_wait(FrameEvent* e) { LightEvent_Wait(e); }
+static void frame_event_close(FrameEvent* e) { (void)e; }
+#else
+typedef struct { pthread_mutex_t lock; pthread_cond_t wake; int set; } FrameEvent;
+static int frame_event_init(FrameEvent* e) {
+    if (pthread_mutex_init(&e->lock, NULL)) return -1;
+    if (!pthread_cond_init(&e->wake, NULL)) return 0;
+    pthread_mutex_destroy(&e->lock);
+    return -1;
+}
+static void frame_signal(FrameEvent* e) {
+    pthread_mutex_lock(&e->lock);
+    e->set=1;
+    pthread_cond_signal(&e->wake);
+    pthread_mutex_unlock(&e->lock);
+}
+static void frame_wait(FrameEvent* e) {
+    pthread_mutex_lock(&e->lock);
+    while (!e->set) pthread_cond_wait(&e->wake, &e->lock);
+    e->set=0;
+    pthread_mutex_unlock(&e->lock);
+}
+static void frame_event_close(FrameEvent* e) {
+    pthread_cond_destroy(&e->wake);
+    pthread_mutex_destroy(&e->lock);
+}
+#endif
+struct SourceFrameWorker {
+    FrameEvent work, done;
+    void (*job)(void*);
+    void* input;
+    int core, busy;
+#ifdef __3DS__
+    Thread thread;
+#else
+    pthread_t thread;
+#endif
+};
+static void frame_worker_loop(void* arg) {
+    SourceFrameWorker* w=arg;
+#ifdef __3DS__
+    // threadCreate accepted a single fixed affinity; Azahar 2126.2 does
+    // not implement the optional GetCurrentProcessorNumber diagnostic SVC.
+    w->core=2;
+#else
+    w->core=-1;
+#endif
+    frame_signal(&w->done);
+    for (;;) {
+        frame_wait(&w->work);
+        if (!w->job) break;
+        w->job(w->input);
+        frame_signal(&w->done);
+    }
+}
+#ifndef __3DS__
+static void* frame_worker_host(void* arg) { frame_worker_loop(arg); return NULL; }
+#endif
+SourceFrameWorker* source_frame_worker_create(void) {
+    SourceFrameWorker* w=calloc(1,sizeof(*w));
+    if (!w) return NULL;
+    if (frame_event_init(&w->work)) goto free_worker;
+    if (frame_event_init(&w->done)) goto close_work;
+#ifdef __3DS__
+    w->thread=threadCreate(frame_worker_loop,w,32768,0x30,2,false);
+    if (!w->thread) goto close_done;
+#else
+    if (pthread_create(&w->thread,NULL,frame_worker_host,w)) goto close_done;
+#endif
+    frame_wait(&w->done);
+    return w;
+close_done:
+    frame_event_close(&w->done);
+close_work:
+    frame_event_close(&w->work);
+free_worker:
+    free(w);
+    return NULL;
+}
+int source_frame_worker_core(const SourceFrameWorker* w) { return w->core; }
+void source_frame_worker_submit(SourceFrameWorker* w, void (*job)(void*), void* input) {
+    w->job=job;
+    w->input=input;
+    w->busy=1;
+    frame_signal(&w->work);
+}
+void source_frame_worker_wait(SourceFrameWorker* w) {
+    if (w->busy) { frame_wait(&w->done); w->busy=0; }
+}
+void source_frame_worker_destroy(SourceFrameWorker* w) {
+    if (!w) return;
+    source_frame_worker_wait(w);
+    w->job=NULL;
+    frame_signal(&w->work);
+#ifdef __3DS__
+    threadJoin(w->thread,UINT64_MAX);
+    threadFree(w->thread);
+#else
+    pthread_join(w->thread,NULL);
+#endif
+    frame_event_close(&w->done);
+    frame_event_close(&w->work);
+    free(w);
+}

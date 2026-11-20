@@ -2343,7 +2343,7 @@
    ]
   },
   "gfx/dx9/nx/occlude.cpp": {
-   "sha256": "9b8b536d57dd86b13d15e14f21286f5a36061adf7da2958b9e2e55b4d96898c0",
+   "sha256": "06b6b092d6fa4f04236525cd71524af0df116afd911a1b26a7fe312acb961b60",
    "edits": [
     [
      1538,
@@ -2489,7 +2489,7 @@
      17234,
      17234,
      [
-      "const Mth::Vector* NativeSelectedOccluder(unsigned i)\n{\n    if(i>=sOccluder::NumOccluders||!sOccluder::Occluders[i].p_poly->available)return nullptr;\n    return sOccluder::Occluders[i].p_poly->verts;\n}\nvoid NativeScoreOccluder(unsigned i)\n{\n    Dbg_Assert(i<sOccluder::NumOccluders);\n    ++sOccluder::Occluders[i].score[CurrentView];\n}\n"
+      "unsigned NativeOcclusionPolyCount(){return NumOcclusionPolys;}\nconst Mth::Vector* NativeUnusedOccluder(unsigned i)\n{\n    return i<NumOcclusionPolys && OcclusionPolys[i].available && !OcclusionPolys[i].in_use ? OcclusionPolys[i].verts : nullptr;\n}\nconst Mth::Vector* NativeSelectedOccluder(unsigned i)\n{\n    if(i>=sOccluder::NumOccluders||!sOccluder::Occluders[i].p_poly->available)return nullptr;\n    return sOccluder::Occluders[i].p_poly->verts;\n}\nvoid NativeScoreOccluder(unsigned i)\n{\n    Dbg_Assert(i<sOccluder::NumOccluders);\n    ++sOccluder::Occluders[i].score[CurrentView];\n}\n"
      ]
     ]
    ]

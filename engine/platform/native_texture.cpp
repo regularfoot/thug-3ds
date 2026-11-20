@@ -14,13 +14,17 @@
 #include <cmath>
 #include <string>
 namespace {
+uint64 texture_generation=1;
 unsigned pot(unsigned n){unsigned p=8;while(p<n&&p<1024)p*=2;return p;}
 void controller(){Dbg_Assert(source_thread_is_controller());}
 uint8 byte(float v){return uint8(std::lround(std::clamp(v,0.f,255.f)));}
 }
+namespace SourcePort {
+uint64 WorldTextureGeneration(){return texture_generation;}
+}
 namespace Nx {
-CNativeTexture::CNativeTexture(){SetPerm(true);m_checksum=0;}
-CNativeTexture::~CNativeTexture(){SourcePort::ForgetProjectionTexture(this);plat_remove_from_vram();}
+CNativeTexture::CNativeTexture(){++texture_generation;SetPerm(true);m_checksum=0;}
+CNativeTexture::~CNativeTexture(){++texture_generation;SourcePort::ForgetProjectionTexture(this);plat_remove_from_vram();}
 bool CNativeTexture::Assign(SourcePort::TextureAsset asset){
     controller();if((!asset.bytes&&!asset.disk)||asset.levels.empty())return false;
     if(!plat_remove_from_vram())return false;asset_=std::move(asset);m_checksum=asset_.checksum;
@@ -332,8 +336,8 @@ CTexture* CNativeTexDict::plat_reload_texture(const char* name){
     if(old){bool ok=old->ReplaceTexture(fresh);delete fresh;return ok?old:nullptr;}AddTexture(fresh);return fresh;
 }
 bool CNativeTexDict::plat_unload_texture(CTexture* texture){if(!texture||mp_texture_lookup->GetItem(texture->GetChecksum())!=texture)return false;delete texture;return true;}
-void CNativeTexDict::plat_add_texture(CTexture* texture){Dbg_Assert(dynamic_cast<CNativeTexture*>(texture)&&mp_texture_lookup->GetItem(texture->GetChecksum())==texture);if(SourcePort::GraphicsReady())Dbg_Assert(texture->AddToVram());}
-bool CNativeTexDict::plat_remove_texture(CTexture* texture){if(!texture||mp_texture_lookup->GetItem(texture->GetChecksum())!=texture)return false;mp_texture_lookup->FlushItem(texture->GetChecksum());return true;}
+void CNativeTexDict::plat_add_texture(CTexture* texture){++texture_generation;Dbg_Assert(dynamic_cast<CNativeTexture*>(texture)&&mp_texture_lookup->GetItem(texture->GetChecksum())==texture);if(SourcePort::GraphicsReady())Dbg_Assert(texture->AddToVram());}
+bool CNativeTexDict::plat_remove_texture(CTexture* texture){if(!texture||mp_texture_lookup->GetItem(texture->GetChecksum())!=texture)return false;++texture_generation;mp_texture_lookup->FlushItem(texture->GetChecksum());return true;}
 bool CTexDict::RemoveTexture(CTexture* texture){return plat_remove_texture(texture);}
 CTexture* CNativeTexDict::plat_copy_texture(uint32 key,CTexture* texture){auto* native=dynamic_cast<CNativeTexture*>(texture);if(!native)return nullptr;auto* copy=new CNativeTexture;
     if(!copy->plat_replace_texture(native)){delete copy;return nullptr;}copy->m_checksum=key;return copy;}

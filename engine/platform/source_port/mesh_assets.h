@@ -32,6 +32,8 @@ struct RenderTopology {
 };
 bool BuildRenderTopology(const SceneAsset&,std::size_t sector,std::size_t mesh,unsigned lod,
     const CASAsset*,uint32 hide_mask,RenderTopology&);
+std::vector<uint16> CompactSourceStrip(const std::vector<uint16>& strip, const std::vector<uint16>& vertices,
+                                      const std::vector<uint16>& triangles);
 void SimplifyGameplaySkin(const SectorAsset&,RenderTopology&);
 bool BuildDistantRenderTopology(const SectorAsset&,const MeshAsset&,RenderTopology&);
 bool PoseRenderTopology(const SectorAsset&,const RenderTopology&,const Mth::Matrix* bones,int num_bones,

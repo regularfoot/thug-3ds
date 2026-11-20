@@ -28,6 +28,8 @@
 #include <gfx/nxmiscfx.h>
 #include <sys/timer.h>
 #include <algorithm>
+#include <unordered_set>
+#include <cstring>
 #ifdef __3DS__
 #include <sk/modules/skate/skate.h>
 #include <sk/modules/skate/gamemode.h>
@@ -97,9 +99,79 @@ struct VancouverTrial {
 // the same 120-degree arc in 30 warm-up frames, then samples it in 60.
 struct TurnTrial {
     static constexpr unsigned block=90;
-    struct Sample {unsigned us,upload,submit,pose,loads,evictions,draws,reused,groups,fx,wet,music,blocks;};
+    struct Sample {unsigned us,upload,submit,pose,loads,evictions,draws,reused,groups,fx,wet,music,blocks,strip_runs,saved_indices,worker_items,window_savings;};
     std::array<std::vector<Sample>,16> samples;
-    unsigned saved_groups=0;
+    struct Presentation {SourcePresentSample frame; unsigned period;};
+    std::array<std::vector<Presentation>,2> presentations;
+    void AddPresentation(unsigned tag){
+        if(!tag||(tag-1)%block<30)return;
+        SourcePresentSample frame{},previous{};
+        Dbg_MsgAssert(source_graphics_present_sample(tag,&frame) && source_graphics_present_sample(tag-1,&previous) &&
+            frame.swap_tick>previous.swap_tick,("Missing consecutive presentations %u",tag));
+        const unsigned mode=SourcePort::FrameOverlapEnabled(tag);
+        Dbg_MsgAssert(frame.deferred==mode,("Frame overlap mode mismatch at %u",tag));
+        SourcePort::NativeHeapScope storage;
+        presentations[mode].push_back({frame,unsigned(frame_us(frame.swap_tick-previous.swap_tick))});
+    }
+    void ReportPresentations(){
+        for(unsigned mode=0;mode<2;++mode){
+            const auto& measured=presentations[mode];
+            if(measured.empty())continue;
+            uint64 cpu=0,geometry=0,tail=0,hold=0,draws=0;
+            unsigned active=0,geom_active=0,started=0;
+            for(const auto& row:measured){
+                const auto& f=row.frame;
+                draws+=f.draws;cpu+=f.cpu_overlap;geometry+=f.geometry_overlap;tail+=f.draw_tail;hold+=f.hold_after_draw;
+                active+=f.cpu_overlap!=0;geom_active+=f.geometry_overlap!=0;started+=f.next_cpu_started;
+            }
+            SourcePort::Log("OVERLAP_RESULT mask=%u frames=%u draws=%llu next_cpu=%u cpu_active=%u geom_active=%u cpu_us=%llu geom_us=%llu tail_us=%llu hold_us=%llu",
+                mode,unsigned(measured.size()),draws,started,active,geom_active,frame_us(cpu),frame_us(geometry),frame_us(tail),frame_us(hold));
+            for(std::size_t i=0;i<measured.size();i+=24){
+                char values[288]{};size_t used=0;
+                for(auto j=i;j<std::min(i+24,measured.size());++j)
+                    used+=std::snprintf(values+used,sizeof(values)-used," %u",measured[j].period);
+                SourcePort::Log("PRESENT_TIMES mask=%u%s",mode,values);
+            }
+        }
+    }
+    struct TailFrame {
+        unsigned period,geometry,upload,submit,visual,audio_fx,music,audio_blocks,draws,loads,evictions,fx_batches,extra_walls;
+        bool walls_enabled;
+    };
+    std::unique_ptr<SourcePort::WorldOcclusion> reference_visibility;
+    std::vector<TailFrame> tail_frames;
+    std::vector<uint64> uploaded_runs;
+    unsigned fx_batches=0,extra_walls=0;
+    bool walls_enabled=false;
+    void InitTail(){
+        if(SourcePort::DenseWallReference()){
+            reference_visibility=std::make_unique<SourcePort::WorldOcclusion>();
+            SourcePort::Log("DENSE_WALL_REFERENCE no_authored_walls=1");
+        }
+        tail_frames.reserve(SourcePort::PerformanceRouteLength);
+        uploaded_runs.reserve(8192);
+    }
+    void ReportTail()const{
+        SourcePort::NativeHeapScope storage;
+        std::unordered_set<uint64> seen;
+        std::size_t index=0;
+        const auto* city=SourcePort::DenseDrawScene();
+        if(!city)city="NY";
+        for(unsigned i=0;i<tail_frames.size();++i){
+            const auto& r=tail_frames[i];
+            unsigned repeats=0;
+            for(unsigned j=0;j<r.loads;++j){
+                Dbg_Assert(index<uploaded_runs.size());
+                if(!seen.insert(uploaded_runs[index++]).second)++repeats;
+            }
+            SourcePort::Log("%s_TAIL step=%u retain=%u omit=%u us=%u geom=%u upload=%u submit=%u visual=%u sound=%u music=%u draws=%u loads=%u repeats=%u evict=%u fx_batches=%u dense_walls=%u extra_walls=%u audio_blocks=%u",
+                city,i+1,unsigned(SourcePort::KeepTurnBuffers()),unsigned(SourcePort::OmitTurnEffects(i+1)),
+                r.period,r.geometry,r.upload,r.submit,r.visual,r.audio_fx,r.music,r.draws,r.loads,repeats,r.evictions,r.fx_batches,unsigned(r.walls_enabled),r.extra_walls,r.audio_blocks);
+        }
+        Dbg_Assert(index==uploaded_runs.size());
+    }
+    uint64 geometry_us[2]{},command_us[2]{};
+    unsigned saved_groups=0,window_savings=0;
     Mth::Vector reference_position,reference_back;
     bool have_reference=false;
     void Camera(SourcePort::WorldView& view,unsigned step,bool moscow){
@@ -113,7 +185,19 @@ struct TurnTrial {
         view.position=reference_position;
         view.axes.Ident();
         view.axes[Z]=reference_back;
-        if(moscow){
+        const auto* trial_city=SourcePort::DenseDrawScene();
+        if(trial_city && std::strcmp(trial_city,"HI")==0){
+            // Above the original TRG_Restart_Player1, facing inland.
+            view.position.Set(-2203.36f,128.f,2605.69f,1);
+            view.axes[Z].Set(-.45f,.16f,.88f,0);
+        }else if(trial_city && std::strcmp(trial_city,"VC")==0){
+            VancouverTrial::FountainView(view);
+        }else if(!moscow && (SourcePort::CompareCityCpu()||SourcePort::CityTailTrial())){
+            // Use the recorded pose even if the live player has moved slightly
+            // before the benchmark's first tick.
+            view.position.Set(4687.4f,133.4f,-6409.3f,1.f);
+            view.axes[Z].Set(.98385f,.1790f,0.f,0.f);
+        }else if(moscow){
             view.position.Set(-2911.3f,77.4f,784.2f,1.f);
             view.axes[Z].Set(-.988f,.1505f,.0362f,0);
         }
@@ -122,34 +206,75 @@ struct TurnTrial {
         view.axes[Y]=Mth::CrossProduct(view.axes[Z],view.axes[X]);view.axes.RotateY(angle);
         view.hfov=72.f;
     }
-    void Record(unsigned step,unsigned period,unsigned upload,unsigned submit,unsigned pose,
-                const SourcePort::WorldResidencyStats& resident,unsigned reused){
+    void Record(unsigned step,unsigned period,unsigned geometry,unsigned upload,unsigned submit,unsigned pose,unsigned visual,
+                const SourcePort::WorldResidencyStats& resident,unsigned reused,unsigned worker_items){
+        if(SourcePort::CityTailTrial()){
+            const auto mix=SourcePort::CurrentAudioMixTicks();
+            tail_frames.push_back({period,geometry,upload,submit,visual,unsigned(frame_us(mix.effects)),unsigned(frame_us(mix.streams)),mix.blocks,
+                source_graphics_frame_draw_calls(),unsigned(resident.uploads),unsigned(resident.evictions),fx_batches,extra_walls,walls_enabled});
+            return;
+        }
+        if(SourcePort::CompareFrameOverlap()){
+            AddPresentation(step-1);
+            if(step==SourcePort::PerformanceRouteLength)AddPresentation(step);
+        }
         if((step-1)%block<30)return;
-        const unsigned mode=SourcePort::CompareStereoCityTurns()?unsigned(SourcePort::UseOptimizedFramePath(step)):SourcePort::TurnOptions(step);
+        unsigned mode=SourcePort::TurnOptions(step);
+        if(SourcePort::CompareCityCpu()){
+            mode=SourcePort::CityCpuFast(step);
+            geometry_us[mode]+=geometry;
+            command_us[mode]+=frame_us(source_graphics_command_ticks());
+        }else if(SourcePort::CompareFrameOverlap())mode=SourcePort::FrameOverlapEnabled(step);
+        else if(SourcePort::CompareManhattanFrame())mode=SourcePort::ManhattanFrameOptions(step);
+        else if(SourcePort::CompareSourceStrips())mode=SourcePort::SourceStripsEnabled(step);
+        else if(SourcePort::CompareStereoCityTurns())mode=SourcePort::UseOptimizedFramePath(step);
         auto& rows=samples[mode];
         SourcePort::NativeHeapScope storage;
         if(rows.empty())rows.reserve(120);
         const auto audio=SourcePort::CurrentAudioMixTicks();
         rows.push_back({period,upload,submit,pose,unsigned(resident.uploads),unsigned(resident.evictions),
             source_graphics_frame_draw_calls(),reused,saved_groups,unsigned(frame_us(audio.effects)),
-            unsigned(frame_us(audio.reverb)),unsigned(frame_us(audio.streams)),audio.blocks});
+            unsigned(frame_us(audio.reverb)),unsigned(frame_us(audio.streams)),audio.blocks,unsigned(resident.strip_runs),unsigned(resident.strip_saved_indices),worker_items,window_savings});
     }
     void Report(){
+        if(SourcePort::CityTailTrial()){
+            // The trace is larger than a journal page. Flush once after timing
+            // has stopped so reporting cannot overwrite the startup metadata.
+            Dbg_Assert(SourcePort::CheckpointDiagnosticLog());
+            ReportTail();return;
+        }
+        if(SourcePort::CompareFrameOverlap())ReportPresentations();
         for(unsigned mask=0;mask<samples.size();++mask){
             auto& rows=samples[mask];if(rows.empty())continue;
             std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return a.us<b.us;});
             uint64 total=0,upload=0,submit=0,pose=0,loads=0,evictions=0,draws=0,reused=0,groups=0,fx=0,wet=0,music=0,blocks=0;
             unsigned late=0,peak_loads=0;
+            uint64 strips=0,saved_indices=0,worker_items=0;unsigned worker_frames=0,window_calls=0;
             for(const auto& r:rows){
                 total+=r.us;upload+=r.upload;submit+=r.submit;pose+=r.pose;loads+=r.loads;evictions+=r.evictions;
                 draws+=r.draws;reused+=r.reused;groups+=r.groups;fx+=r.fx;wet+=r.wet;music+=r.music;blocks+=r.blocks;
+                window_calls+=r.window_savings;
+                worker_items+=r.worker_items;worker_frames+=r.worker_items!=0;
+                strips+=r.strip_runs;saved_indices+=r.saved_indices;
                 peak_loads=std::max(peak_loads,r.loads);
                 late+=r.us>33333;
             }
             const unsigned n=rows.size();
             auto percentile=[&](unsigned p){return rows[(n*p+99)/100-1].us;};
-            SourcePort::Log("TURN_RESULT mask=%u frames=%u total_us=%llu p50=%u p95=%u p99=%u max=%u late=%u upload_us=%llu submit_us=%llu pose_us=%llu loads=%llu evictions=%llu draws=%llu reused=%llu groups=%llu fx_us=%llu wet_us=%llu music_us=%llu audio_blocks=%llu peak_loads=%u",
-                mask,n,total,percentile(50),percentile(95),percentile(99),rows.back().us,late,upload,submit,pose,loads,evictions,draws,reused,groups,fx,wet,music,blocks,peak_loads);
+            if(SourcePort::CompareCityCpu())
+                SourcePort::Log("CITY_CPU mask=%u frames=%u geometry_us=%llu commands_us=%llu",mask,n,
+                    (unsigned long long)geometry_us[mask],(unsigned long long)command_us[mask]);
+            if(SourcePort::CompareManhattanFrame()||SourcePort::CompareCityCpu()){
+                SourcePort::Log("FRAME_SORT mask=%u worker_frames=%u worker_items=%llu window_calls=%u",mask,worker_frames,worker_items,window_calls);
+                for(unsigned first=0;first<n;first+=24){
+                    char times[288]{};std::size_t used=0;
+                    for(unsigned k=first;k<std::min(n,first+24);++k)
+                        used+=std::snprintf(times+used,sizeof(times)-used," %u",rows[k].us);
+                    SourcePort::Log("FRAME_TIMES mask=%u%s",mask,times);
+                }
+            }
+            SourcePort::Log("TURN_RESULT mask=%u frames=%u total_us=%llu p50=%u p95=%u p99=%u max=%u late=%u upload_us=%llu submit_us=%llu pose_us=%llu loads=%llu evictions=%llu draws=%llu reused=%llu groups=%llu fx_us=%llu wet_us=%llu music_us=%llu audio_blocks=%llu peak_loads=%u strip_runs=%llu saved_indices=%llu",
+                mask,n,total,percentile(50),percentile(95),percentile(99),rows.back().us,late,upload,submit,pose,loads,evictions,draws,reused,groups,fx,wet,music,blocks,peak_loads,strips,saved_indices);
         }
     }
 };
@@ -193,10 +318,13 @@ struct RouteProfile {
             ambient=std::make_unique<VancouverTrial>();
             ambient->samples.reserve(SourcePort::PerformanceRouteLength);
         }
-        if((level==Crc::GenerateCRCFromString("RU")&&SourcePort::MoscowTurnTrial())||
+        const auto* trial_city=SourcePort::DenseDrawScene();
+        if((trial_city && level==Crc::GenerateCRCFromString(trial_city))||
+           (level==Crc::GenerateCRCFromString("RU")&&SourcePort::MoscowTurnTrial())||
            (level==Crc::GenerateCRCFromString("NY")&&SourcePort::ManhattanTurnTrial())){
             SourcePort::NativeHeapScope storage;
             turn=std::make_unique<TurnTrial>();
+            if(SourcePort::CityTailTrial())turn->InitTail();
         }
         stereo=has_stereo;
         running=true;
@@ -220,8 +348,8 @@ struct RouteProfile {
         const auto now=source_clock_now(), vblank=Tmr::GetVblanks();
         const auto period=now-previous_tick;
         const unsigned step=SourcePort::PerformanceRouteStep();
-        if(turn&&step)turn->Record(step,unsigned(frame_us(period)),unsigned(frame_us(upload_ticks)),
-            unsigned(frame_us(submit_ticks)),unsigned(frame_us(pose_ticks)),cache,detail.shared_positions);
+        if(turn&&step)turn->Record(step,unsigned(frame_us(period)),unsigned(frame_us(geometry_ticks)),unsigned(frame_us(upload_ticks)),
+            unsigned(frame_us(submit_ticks)),unsigned(frame_us(pose_ticks)),unsigned(frame_us(effects_ticks)),cache,detail.shared_positions,detail.worker_items);
         if(ambient&&VancouverTrial::Measured(step))
             ambient->samples.push_back({step,unsigned(frame_us(period)),unsigned(frame_us(effects_ticks)),source_graphics_frame_draw_calls(),elements,fx});
         if(compare_city&&step&&(step-1)%9>=2){
@@ -274,7 +402,8 @@ struct RouteProfile {
     }
     void Finish(bool complete) {
         if(!running)return;
-        if(turn)turn->Report();
+        // An interrupted stereo route may have uploads for an unfinished frame.
+        if(turn && (complete || !SourcePort::CityTailTrial()))turn->Report();
         if(frames) SourcePort::Log("PERF_ROUTE scene=%08x eyes=%u complete=%u frames=%u elapsed_us=%llu p50_ms=%u p99_ms=%u max_us=%llu worst_30_us=%llu late_slots=%u geometry_us=%llu pose_us=%llu upload_us=%llu ui_us=%llu submit_us=%llu fill_us=%llu draw_wait_us=%llu transfer_us=%llu swap_us=%llu skin_draws=%u early_frames=%u",
             scene,stereo?2:1,unsigned(complete),frames,frame_us(elapsed),Percentile(50),Percentile(99),frame_us(max_period),frame_us(worst_window),late,
             frame_us(geometry)/frames,frame_us(pose)/frames,frame_us(upload)/frames,frame_us(ui)/frames,frame_us(submit)/frames,
@@ -371,6 +500,7 @@ struct Renderer {
     std::vector<std::unique_ptr<SourcePort::NativeWorldBatch>> worlds;
     std::vector<SourcePort::WorldBatch> batches;
     SourcePort::WorldOcclusion occlusion;
+    std::unique_ptr<SourcePort::WorldOcclusion> subway_tiles;
     SourcePort::NativeUIBatch ui;std::vector<SourceDrawPacket> packets;
     bool frame=false,letterbox=false;
     float stereo=0;
@@ -378,6 +508,8 @@ struct Renderer {
     FrameProfile profile;
 #ifdef __3DS__
     RouteProfile route;
+    std::unique_ptr<SourceFrameWorker,decltype(&source_frame_worker_destroy)> sort_worker{nullptr,source_frame_worker_destroy};
+    bool tried_sort_worker=false;
     uint32 benchmark_scene=0;
     bool watch_moscow=false,vancouver_early=false,route_started=false;
     uint64 moscow_checkpoint=0;
@@ -434,12 +566,14 @@ void CEngine::s_plat_pre_render(){
     Dbg_Assert(SourcePort::WorldRendererReady()&&SourcePort::GraphicsReady()&&!renderer->frame);
     SourcePort::MarkDiagnosticFrame(renderer->profile.frame+1,SourcePort::DiagnosticFramePhase::Logic);
 #ifdef __3DS__
+    Dbg_Assert(source_graphics_overlap_phase(0)==0);
     SourcePort::LoadStartupSaveWhenReady();
 #endif
     renderer->profile.Begin();source_graphics_reset_frame_timing();SourcePort::RootHeapScope scratch(SourcePort::RootHeapDirection::TopDown);if(source_render_options()->detailed_shadows)SourcePort::RenderOriginalShadowTargets(Tmr::GetTime());renderer->packets.clear();renderer->frame=true;renderer->profile.End(FrameProfile::Shadow);auto next=renderer->profile.frame+1;SourcePort::BeginLogicTiming(next<=4||next%32==0||(SourcePort::MoscowTurnTrial()&&SourcePort::PerformanceRouteStep()));
 }
 void CEngine::s_plat_render_world(){
     Dbg_Assert(renderer&&renderer->frame);
+    Dbg_Assert(source_graphics_overlap_phase(1)==0);
     uint32 now=Tmr::GetTime();int count=CViewportManager::sGetNumActiveViewports();
     SourcePort::RootHeapScope scratch(SourcePort::RootHeapDirection::TopDown);
     SourcePort::EndLogicTiming();
@@ -450,7 +584,8 @@ void CEngine::s_plat_render_world(){
     renderer->stereo=source_graphics_slider();Dbg_Assert(std::isfinite(renderer->stereo)&&renderer->stereo>=0&&renderer->stereo<=1);
     const Nx::CModel* local_model=nullptr;
     bool local_arrays=false;
-    bool city_stereo=false;
+    bool strip_city=false, city_stereo=false;
+    bool level_dense_walls=false, trial_dense_walls=false;
 #ifdef __3DS__
     bool vancouver=sGetScene(Crc::GenerateCRCFromString("VC"))!=nullptr;
     const auto options=renderer->route.Options(SourcePort::PerformanceRouteStep());
@@ -465,12 +600,21 @@ void CEngine::s_plat_render_world(){
             static const auto moscow=Crc::GenerateCRCFromString("RU");
             local_arrays=sGetScene(moscow)!=nullptr;
             static const auto manhattan=Crc::GenerateCRCFromString("NY");
-            city_stereo=count==1&&renderer->stereo>0&&(local_arrays||sGetScene(manhattan));
+            strip_city=count==1&&(local_arrays||sGetScene(manhattan));
+            city_stereo=strip_city&&renderer->stereo>0;
+            if(count==1 && renderer->stereo>0 && !strip_city){
+                static const auto hawaii=Crc::GenerateCRCFromString("HI");
+                level_dense_walls=vancouver || sGetScene(hawaii)!=nullptr;
+            }
             renderer->vancouver_early=vancouver && count==1 && (options&1);
             renderer->watch_moscow=local_arrays || vancouver ||
                 sGetScene(Crc::GenerateCRCFromString("SE"))!=nullptr;
             if(local_model&&count==1&&SourcePort::PerformanceRouteEnabled()) {
-                if(local_arrays)renderer->benchmark_scene=moscow;
+                const auto* trial_city=SourcePort::DenseDrawScene();
+                if(trial_city && sGetScene(Crc::GenerateCRCFromString(trial_city))){
+                    renderer->benchmark_scene=Crc::GenerateCRCFromString(trial_city);
+                    trial_dense_walls=renderer->stereo>0;
+                }else if(local_arrays)renderer->benchmark_scene=moscow;
                 else for(const auto* name:{"NY","SC2","VN","VC","SE"}) {
                     const auto key=Crc::GenerateCRCFromString(name);
                     if(sGetScene(key)){renderer->benchmark_scene=key;break;}
@@ -484,13 +628,18 @@ void CEngine::s_plat_render_world(){
         if(i==0 && renderer->route.running && renderer->route.turn){
             const auto step=SourcePort::PerformanceRouteStep();
             if(step){
-                if((step-1)%TurnTrial::block==0)renderer->worlds[i]->Release();
+                if(step==1 || (!SourcePort::CityTailTrial() && (step-1)%TurnTrial::block==0))
+                    renderer->worlds[i]->Release();
+                if(SourcePort::CityTailTrial())view.upload_trace=&renderer->route.turn->uploaded_runs;
                 // Adjacent, untimed game-camera captures exercise the visible
                 // player before a long comparison on the scripted city turn.
                 if(SourcePort::CompareStereoCityTurns()&&(step==4||step==5))
                     Gfx::Manager::Instance()->ScreenShot(step==4?"skater_cpu":"skater_gpu");
                 else renderer->route.turn->Camera(view,step,local_arrays);
-                if(SourcePort::CompareStereoCityTurns()&&(step==20||step==110))
+                if(SourcePort::CompareManhattanFrame() && step<=290 && (step-1)%90==19){
+                    static const char* names[]={"ny_control","ny_groups","ny_core","ny_both"};
+                    Gfx::Manager::Instance()->ScreenShot(names[SourcePort::ManhattanFrameOptions(step)]);
+                }else if(!SourcePort::CompareManhattanFrame()&&SourcePort::CompareStereoCityTurns()&&(step==20||step==110))
                     Gfx::Manager::Instance()->ScreenShot(step==20?"turn_before":"turn_after");
             }
         }
@@ -515,12 +664,34 @@ void CEngine::s_plat_render_world(){
         }
         auto& occlusion=renderer->occlusion;
         const bool fast_city=city_stereo && SourcePort::UseOptimizedFramePath(SourcePort::PerformanceRouteStep());
+        view.use_source_strips=city_stereo&&SourcePort::SourceStripsEnabled(SourcePort::PerformanceRouteStep());
+        view.prepare_source_strips=strip_city&&(SourcePort::CompareSourceStrips()||SourcePort::SourceStripsEnabled(0));
         source_graphics_fast_index_commands(fast_city);
+        view.refine_static_leaves=fast_city && SourcePort::CityCpuFast(SourcePort::PerformanceRouteStep());
+        view.keep_turn_buffers=fast_city && !local_arrays && SourcePort::KeepTurnBuffers();
+        // Moscow uses the same CPU gather, with its existing GPU submission path.
+        source_graphics_city_cpu(view.refine_static_leaves && !local_arrays,SourcePort::CompareCityCpu());
         // Citro3D's tilted projection has a horizontal view-space translation
         // of (iod / 2) * tan(hfov / 2). Use the same stereo sample as submit.
         const float eye_shift=.5f*source_stereo_iod(renderer->stereo)*std::tan(view.hfov*float(Mth::PI)/360.f);
         view.stereo_eye_shift=eye_shift;
-        occlusion.Prepare(view.position,view.axes[X],i,eye_shift);view.occlusion=&occlusion;
+        const bool level_walls=level_dense_walls || (fast_city && !local_arrays);
+        const bool use_walls=(level_walls || trial_dense_walls) && SourcePort::UseDenseWalls(level_walls,SourcePort::PerformanceRouteStep());
+        const auto* wall_direction=use_walls ? &view.axes[Z] : nullptr;
+        const auto extra_walls=occlusion.Prepare(view.position,view.axes[X],i,eye_shift,wall_direction);
+        view.occlusion=&occlusion;
+#ifdef __3DS__
+        if(view.upload_trace){
+            auto& trial=*renderer->route.turn;
+            trial.extra_walls=extra_walls;
+            trial.walls_enabled=use_walls;
+            // An empty volume set bypasses wall culling while keeping the
+            // same frustum, LOD and the hardware depth test for reference images.
+            if(trial.reference_visibility)view.occlusion=trial.reference_visibility.get();
+        }
+#else
+        (void)extra_walls;
+#endif
         if(view.performance){
             const bool old_console = source_application_os_is_old_3ds();
             if(!old_console&&SourcePort::CpuMeshCacheEnabled())view.mesh_retention=&renderer->mesh_retention;
@@ -547,6 +718,18 @@ void CEngine::s_plat_render_world(){
             view.local_model=local_model;
             view.local_arrays=local_arrays;
 #ifdef __3DS__
+            if(city_stereo&&!local_arrays){
+                const unsigned frame_options=SourcePort::ManhattanFrameOptions(SourcePort::PerformanceRouteStep());
+                view.wide_static_groups=(frame_options&1)!=0;
+                if(frame_options&2){
+                    if(!renderer->tried_sort_worker){
+                        renderer->tried_sort_worker=true;
+                        renderer->sort_worker.reset(source_frame_worker_create());
+                        SourcePort::Log("FRAME_SORT_WORKER affinity=%d",renderer->sort_worker?source_frame_worker_core(renderer->sort_worker.get()):-1);
+                    }
+                    view.sort_worker=renderer->sort_worker.get();
+                }
+            }
             view.profile_pose=renderer->route.running||renderer->profile.frame<4||(renderer->profile.frame+1)%32==0;
             if(count==1&&local_model&&!old_console){
                 const auto trial=SourcePort::TurnOptions(SourcePort::PerformanceRouteStep());
@@ -565,6 +748,10 @@ void CEngine::s_plat_render_world(){
             view.detail_stats=&renderer->profile.detail;
         }
         const bool material_sorted=SourcePort::GatherNativeWorld(view,now,batches,view.performance);
+        if(strip_city&&!local_arrays&&view.performance&&view.position[Y]<0){
+            if(!renderer->subway_tiles)renderer->subway_tiles=std::make_unique<SourcePort::WorldOcclusion>();
+            renderer->profile.occluded_meshes+=renderer->subway_tiles->CullBehindSubwayTiles(view,batches);
+        }
         renderer->profile.occluded_meshes+=occlusion.HiddenMeshes();
         renderer->profile.occluded_triangles+=occlusion.HiddenTriangles();
         renderer->profile.End(FrameProfile::Geometry);
@@ -573,7 +760,8 @@ void CEngine::s_plat_render_world(){
         auto transparent=std::find_if(batches.begin(),batches.end(),[](const auto& b){return !b.sky&&!b.opaque;});
         std::size_t sorted_prefix=material_sorted?std::size_t(transparent-batches.begin()):0;
         batches.insert(transparent,std::make_move_iterator(splats.begin()),std::make_move_iterator(splats.end()));
-        {
+        const auto before_effects=batches.size();
+        if(!SourcePort::OmitTurnEffects(SourcePort::PerformanceRouteStep())){
             SourcePort::EffectRenderScope effects(view,batches);
             ShatterRender();
             const auto legacy_begin=batches.size();
@@ -589,6 +777,11 @@ void CEngine::s_plat_render_world(){
                     view.ambient_counts->weather_elements+=unsigned(batches[j].ElementCount());
             }
         }
+#ifdef __3DS__
+        if(view.upload_trace)renderer->route.turn->fx_batches=unsigned(batches.size()-before_effects);
+#else
+        (void)before_effects;
+#endif
         renderer->profile.End(FrameProfile::Effects);if(view.performance){
             // Snapshot/Shatter retains complete original CPU data; omit its
             // environment layers only at presentation, together with world reflections.
@@ -599,10 +792,12 @@ void CEngine::s_plat_render_world(){
             const auto coalesce_started=source_clock_now();
             SourcePort::CoalesceOpaqueWorldBatches(batches,sorted_prefix);
             const auto group_started=source_clock_now();
-            const unsigned saved=SourcePort::GroupScreenDisjointWorldBatches(view,batches);
+            unsigned saved=SourcePort::GroupScreenDisjointWorldBatches(view,batches);
+            const unsigned window_savings=view.wide_static_groups?SourcePort::GroupStaticMaterialWindows(view,batches):0;
+            saved+=window_savings;
             renderer->profile.grouped_draws_saved+=saved;
 #ifdef __3DS__
-            if(renderer->route.turn)renderer->route.turn->saved_groups=saved;
+            if(renderer->route.turn){renderer->route.turn->saved_groups=saved;renderer->route.turn->window_savings=window_savings;}
 #endif
             renderer->profile.detail.coalesce_ticks+=group_started-coalesce_started;
             renderer->profile.detail.group_ticks+=source_clock_now()-group_started;
@@ -617,6 +812,7 @@ void CEngine::s_plat_render_world(){
         SourcePort::MarkDiagnosticFrame(renderer->profile.frame+1,SourcePort::DiagnosticFramePhase::Upload);
         bool prepared=renderer->worlds[i]->Prepare(view,batches,packets);Dbg_MsgAssert(prepared,("Original world GPU upload failed errno=%d",errno));
         auto residency=renderer->worlds[i]->ResidencyStats();auto& total=renderer->profile.resident;total.bytes+=residency.bytes;total.meshes+=residency.meshes;total.hits+=residency.hits;total.prefix_hits+=residency.prefix_hits;total.uploads+=residency.uploads;total.evictions+=residency.evictions;total.streamed+=residency.streamed;total.draws+=residency.draws;total.stream_vertices+=residency.stream_vertices;total.stream_uploads+=residency.stream_uploads;total.indexed_meshes+=residency.indexed_meshes;total.static_indexed_runs+=residency.static_indexed_runs;total.stream_indices+=residency.stream_indices;total.budget+=residency.budget;
+        total.strip_runs+=residency.strip_runs;total.strip_saved_indices+=residency.strip_saved_indices;
         renderer->packets.insert(renderer->packets.end(),additional_view.begin(),additional_view.end());
         batches.clear();
         renderer->profile.End(FrameProfile::Upload);
@@ -667,12 +863,23 @@ void CEngine::s_plat_post_render(){
     const auto& packets=renderer->packets;
     SourcePort::MarkDiagnosticFrame(renderer->profile.frame+1,SourcePort::DiagnosticFramePhase::Submit);
     int result;
+#ifdef __3DS__
+    const unsigned step=SourcePort::PerformanceRouteStep();
+    const bool trial=SourcePort::CompareFrameOverlap()&&renderer->route.running;
+    const bool defer=SourcePort::FrameOverlapEnabled(step) && stereo>0 && CViewportManager::sGetNumActiveViewports()==1 && source_application_os_is_new_3ds() &&
+        sGetScene(Crc::GenerateCRCFromString("NY")) && !renderer->letterbox &&
+        !Mdl::Skate::Instance()->GetGameMode()->IsFrontEnd();
+    source_graphics_next_present(trial?step:0,defer);
+#endif
     if(early)result=source_graphics_submit_remaining(packets.data()+early,packets.size()-early,stereo);
 #ifdef __3DS__
     else if(renderer->watch_moscow)result=source_graphics_submit_bounded(packets.data(),packets.size(),clear_color,stereo);
 #endif
     else result=source_graphics_submit(packets.data(),packets.size(),clear_color,stereo);
     Dbg_MsgAssert(result==0,("Original frame GPU submit failed errno=%d",errno));
+#ifdef __3DS__
+    if(trial&&step==SourcePort::PerformanceRouteLength)Dbg_Assert(source_graphics_drain_present()==0);
+#endif
     renderer->profile.End(FrameProfile::Submit);
     renderer->frame=false;renderer->profile.Report(stereo);SourcePort::FinishNativeDiagnostics();
     if(renderer->profile.frame<=4||renderer->profile.frame%32==0)

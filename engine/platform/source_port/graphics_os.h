@@ -10,8 +10,9 @@ typedef struct SourceGpuTexture SourceGpuTexture;
 // Sorted live-handle index. Lookups compare integer addresses without ever
 // dereferencing an untrusted/stale handle. Inserts/removals happen at ownership
 // changes, not once per vertex or submitted packet.
-typedef struct SourceResourceIndex {uintptr_t* keys;size_t count,capacity;} SourceResourceIndex;
+typedef struct SourceResourceIndex {uintptr_t* keys;size_t count,capacity;uintptr_t recent[256];} SourceResourceIndex;
 int source_resource_index_contains(const SourceResourceIndex*,const void*);
+int source_resource_index_cached(SourceResourceIndex*,const void*);
 int source_resource_index_insert(SourceResourceIndex*,const void*);
 int source_resource_index_remove(SourceResourceIndex*,const void*);
 void source_resource_index_close(SourceResourceIndex*);
@@ -28,7 +29,7 @@ typedef struct SourceSkinInfluence {
 // Indices are relative to vertex_base. Validation restricts each range to
 // its own vertex_first/vertex_count span even when ranges share a binding.
 typedef struct SourceIndexRange {
-    unsigned vertex_first,vertex_count,index_first,index_count,vertex_base;
+    unsigned vertex_first,vertex_count,index_first,index_count,vertex_base,triangle_strip;
 } SourceIndexRange;
 size_t source_graphics_stream_bytes(size_t vertices,size_t indices);
 int source_graphics_vertices_finite(const SourceRenderVertex*,size_t);
@@ -104,6 +105,19 @@ unsigned source_graphics_draw_transition(const SourceDrawPacket*,const SourceDra
 int source_graphics_open(void);
 int source_graphics_close(void); // EBUSY if resources still have owners
 int source_graphics_wait(void);
+// One pending stereo picture at most. Its targets, command bytes and inputs
+// remain owned by the GPU until the next acquisition completes presentation.
+typedef struct SourcePresentSample {
+    uint64_t swap_tick, cpu_overlap, geometry_overlap, draw_tail, hold_after_draw;
+    unsigned tag, draws, deferred, next_cpu_started, next_geometry_started;
+} SourcePresentSample;
+void source_graphics_next_present(unsigned tag,int defer);
+int source_graphics_overlap_phase(int geometry);
+int source_graphics_drain_present(void);
+int source_graphics_present_sample(unsigned tag,SourcePresentSample* out);
+void source_graphics_city_cpu(int fast,int measure);
+uint64_t source_graphics_command_ticks(void);
+uint64_t source_graphics_overlap_ticks(uint64_t phase,uint64_t join,uint64_t irq);
 int source_graphics_fog_lut(float near_clip,float far_clip,float start,unsigned alpha,float out[256]);
 typedef struct SourceGraphicsStats {unsigned meshes,textures,vertex_bytes,texture_bytes,rgba8_texture_bytes,vram_free,linear_free,command_recycles,command_peak_words,eyes,gpu_previous_draw_us,gpu_complete_frame_us,vertex_bindings,local_vertex_bindings,offset_bindings,mip_textures,mip_bytes,etc1_textures,etc1_bytes,etc1a4_textures,etc1a4_bytes;uint64_t wait_ticks;unsigned draw_calls,planned_packets,clip_updates,framebuffer_barriers,texture_barriers;} SourceGraphicsStats;
 size_t source_graphics_linear_free(void);

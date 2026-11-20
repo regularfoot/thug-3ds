@@ -58,6 +58,45 @@ bool is_pool_mask(const SourcePort::MaterialPass& base,const SourcePort::Materia
         ((base.texture==0xa54d6d80&&detail.texture==0x3b2c2b40)||
          (base.texture==0x352da6c0&&detail.texture==0xc9d691e0));
 }
+// Retail diffuse maps that mix solid surfaces with an opaque reflection.
+// The colour mask controls the highlight. It is not framebuffer transparency.
+bool solid_reflection_surface(const SourcePort::MaterialAsset& material){
+    const auto& reflection=material.passes[0];
+    const auto& diffuse=material.passes[1];
+    if(material.sorted||material.alpha_cutoff>1||reflection.flags!=0x102c||
+       (diffuse.flags!=0x24&&diffuse.flags!=0x1024)||(reflection.alpha&0xffffff)!=0||
+       (diffuse.alpha&0xffffff)!=5)return false;
+    switch(reflection.texture){
+    case 0x6e6a3840:return diffuse.texture==0xd95c9f00; // NY station corridors
+    case 0xef4d2b40:return diffuse.texture==0xfdb0e178; // NY stairwell tiles
+    case 0x9753b1a0:return diffuse.texture==0x6a16f43c; // HI elevator doors and brushed metal panels
+    case 0xa0489a20: // HI hotel exteriors, apartment and Wallows shutters
+        switch(diffuse.texture){
+        case 0x2d3a3a80:case 0xd76aec58:case 0x4f56929c:case 0x4fcb4f10:
+        case 0xa8d78ce8:case 0xa1e2a038:case 0xdee076c4:case 0xae2ed2a4:
+        case 0xeb5ac85c:case 0xf6e56e48:return true;
+        }
+        return false;
+    case 0xbb4ef240:return diffuse.texture==0x9a61ab0c; // NY Chase floor, ledges and stone plinth
+    case 0x480ecb10:return diffuse.texture==0x9409e7bc; // SE backstage wall and hallway
+    case 0x6fa9c1c0:return diffuse.texture==0xe0274010; // FL roller shutter
+    case 0x485d71a0:case 0x26499aa0:return diffuse.texture==0x127129dc; // VC plaster
+    case 0x93112a90:return diffuse.texture==0x1fa92f8c||diffuse.texture==0xcfec3300; // SE cabinets
+    case 0xbe9f1228:return diffuse.texture==0xa31f9298; // SE loudspeaker
+    case 0x7d854fc8: // RU building fronts with masonry and painted windows
+        switch(diffuse.texture){
+        case 0x754199f4:case 0x83b3dfb0:case 0x4979ae9c:case 0xb9387980:
+        case 0x561370bc:case 0x39abe0e4:case 0x6e094de8:case 0x4a0aaee8:
+        case 0xcb1ea560:case 0x26362360:case 0xc7a118e8:case 0xa296abbc:
+        case 0x40b98ca8:case 0x4dc63fc4:case 0x692fb8a4:case 0xcdfac3a4:
+        case 0xd24439fc:return true;
+        }
+    }
+    return false;
+}
+bool is_deck_sticker_slot(uint32 texture){
+    return texture==0x55528610||texture==0x11ecfc38;
+}
 bool pass_match(const SourcePort::MaterialAsset& m,uint32 name,int pass,unsigned& adjusted){
     if(pass<0||pass>3)return false;adjusted=pass;
     if(m.name!=name&&m.checksum!=name){if(m.name<=name||m.name-name>0x7f)return false;unsigned diff=m.name-name,separate=diff&7,flags=diff>>3;
@@ -104,14 +143,39 @@ void face_billboard(const SourcePort::SectorAsset& source,const std::vector<uint
 }
 namespace SourcePort {
 // The dictionary may be edited between frames (notably Create-a-Deck).
-// Borrow entries only during one read-only pass over the scene registry.
+// Lookups normally live for one gather. Across frames, borrowed entries
+// remain valid only for the generation of the texture dictionaries.
 class WorldTextureLookup {
     struct Entry {const Nx::CTexDict* dict=nullptr; uint32 checksum=0; Nx::CNativeTexture* texture=nullptr;};
-    std::array<Entry,256> slots_{};
+    static constexpr unsigned count=256;
+    std::array<Entry,count> slots_{};
+    // Only the optional inter-frame cache uses the larger table. Dictionary
+    // edits and texture destruction invalidate positive and negative entries.
+    struct Persistent {uint64 generation=0;std::array<Entry,2048> slots;};
+    static std::unique_ptr<Persistent>& Store(){
+        static std::unique_ptr<Persistent> store;
+        return store;
+    }
+    Persistent* persistent_=nullptr;
 public:
+    void ReuseDictionary(){
+        auto& store=Store();
+        if(!store){
+            NativeHeapScope storage;
+            store=std::make_unique<Persistent>();
+        }
+        auto& cache=*store;
+        if(cache.generation!=WorldTextureGeneration()){
+            cache.slots.fill({});
+            cache.generation=WorldTextureGeneration();
+        }
+        persistent_=&cache;
+    }
+    static void Release(){Store().reset();}
     unsigned hits=0,misses=0;
     Nx::CNativeTexture* Resolve(const Nx::CTexDict& dict,uint32 checksum){
-        auto& slot=slots_[(checksum^(checksum>>16)^(reinterpret_cast<std::uintptr_t>(&dict)>>4))&(slots_.size()-1)];
+        const auto hash=checksum^(checksum>>16)^(reinterpret_cast<std::uintptr_t>(&dict)>>4);
+        auto& slot=persistent_?persistent_->slots[hash&(persistent_->slots.size()-1)]:slots_[hash&(count-1)];
         if(slot.dict==&dict&&slot.checksum==checksum){++hits;return slot.texture;}
         ++misses;
         auto* texture=dynamic_cast<Nx::CNativeTexture*>(dict.GetTexture(checksum));
@@ -125,6 +189,7 @@ static Nx::CNativeTexture* world_texture(const WorldView& view,const Nx::CTexDic
 }
 void ReleaseNativeWorldRegistry(){
     controller();Dbg_Assert(geoms.empty());
+    WorldTextureLookup::Release();
     decltype(geoms)().swap(geoms);
     decltype(partition_cells)().swap(partition_cells);
     decltype(partition_entries)().swap(partition_entries);
@@ -238,23 +303,27 @@ static bool PrepareWorldPartition(){
     partition_dirty=false;
     return !partition_cells.empty();
 }
-static void MarkVisibleWorldCells(const WorldView& view,std::size_t node,unsigned planes,unsigned occluders=~0u){
-    const auto& cell=partition_cells[node];
-    const auto delta=cell.center-view.position;
+static bool ClassifyWorldBox(const WorldView& view,const Mth::Vector& center,const Mth::Vector& half,unsigned& planes){
+    const auto delta=center-view.position;
     const float limits[]={-view.near_clip,view.far_clip,view.frustum_eye_pad,view.frustum_eye_pad,0,0};
-    for(unsigned i=0;i<view.frustum_planes.size();++i){
+    for(unsigned bits=planes;bits;bits&=bits-1){
+        const unsigned i=__builtin_ctz(bits);
         const unsigned bit=1u<<i;
-        if(!(planes&bit))continue;
         const auto& plane=view.frustum_planes[i];
         const float distance=Mth::DotProduct(delta,plane.normal);
-        const float radius=Mth::DotProduct(cell.half,plane.absolute);
-        if(distance>limits[i]+radius+.02f)return;
+        const float radius=Mth::DotProduct(half,plane.absolute);
+        if(distance>limits[i]+radius+.02f)return false;
         // Inherit a plane only with enough slack for both the cell and
         // the independently rounded mesh bounds in it.
         const float inside_margin=.125f+8.f*std::numeric_limits<float>::epsilon()*
             (std::abs(distance)+radius+std::abs(limits[i]));
         if(distance+radius<limits[i]-inside_margin)planes&=~bit;
     }
+    return true;
+}
+static void MarkVisibleWorldCells(const WorldView& view,std::size_t node,unsigned planes,unsigned occluders=~0u){
+    const auto& cell=partition_cells[node];
+    if(!ClassifyWorldBox(view,cell.center,cell.half,planes))return;
     // Reject a whole branch only if one original occluder covers the
     // complete AABB from both eyes. Other branches keep per-mesh testing.
     const bool test_occlusion=occluders && view.occlude_static_cells&&view.occlusion&&view.occlusion->HasVolumes();
@@ -270,7 +339,13 @@ static void MarkVisibleWorldCells(const WorldView& view,std::size_t node,unsigne
     }
     for(auto i=cell.first;i<cell.last;++i){
         const auto& entry=partition_entries[i];
-        entry.geom->MarkPartitionVisible(partition_stamp,planes,occluders);
+        unsigned entry_planes=planes,entry_occluders=occluders;
+        if(view.refine_static_leaves && (entry_planes || (test_occlusion&&entry_occluders))){
+            const auto half=(entry.bounds.GetMax()-entry.bounds.GetMin())*.5f;
+            if(entry_planes && !ClassifyWorldBox(view,entry.center,half,entry_planes))continue;
+            if(view.prune_occluders && test_occlusion && entry_occluders && view.occlusion->ClassifyCell(entry.center,half,entry_occluders))continue;
+        }
+        entry.geom->MarkPartitionVisible(partition_stamp,entry_planes,entry_occluders);
         if(view.direct_partition_gather)visible_bits[entry.source_order/32]|=uint32(1)<<(entry.source_order%32);
     }
 }
@@ -367,6 +442,7 @@ bool GatherNativeWorld(const WorldView& view,uint32 time,std::vector<WorldBatch>
     std::optional<WorldTextureLookup> texture_lookup;
     if(view.performance){
         texture_lookup.emplace();
+        if(view.refine_static_leaves)texture_lookup->ReuseDictionary();
         prepared.texture_lookup=&*texture_lookup;
     }
     PrepareWorldFrustum(prepared);
@@ -399,7 +475,7 @@ bool GatherNativeWorld(const WorldView& view,uint32 time,std::vector<WorldBatch>
         gather(geom);
     }
     const auto sort_started=view.detail_stats?source_clock_now():0;
-    const bool material_sorted=SortWorldBatches(out,group_opaque,view.detail_stats);
+    const bool material_sorted=SortWorldBatches(out,group_opaque,view.detail_stats,view.sort_worker);
     if(view.detail_stats){
         if(texture_lookup){
             view.detail_stats->texture_hits+=texture_lookup->hits;
@@ -425,7 +501,8 @@ static bool WorldMaterialCullsBackfaces(const MaterialAsset& material,unsigned b
 void SetWorldMaterialState(WorldDrawState& state,const MaterialAsset& material,unsigned index,
                            unsigned diffuse,unsigned opacity,bool sky,bool performance,bool no_shadow){
     const auto& pass=material.passes[index];
-    const auto& first=material.passes[opacity];
+    const bool solid_base=performance&&index==1&&diffuse==1&&opacity==1&&solid_reflection_surface(material);
+    const auto& first=material.passes[solid_base?0:opacity];
     unsigned first_blend=unsigned(first.alpha)&0xffffff;
     // Original sMesh::Initialize clears previous-mask modes on the base pass.
     if(first_blend==12||first_blend==13)first_blend=0;
@@ -493,6 +570,7 @@ std::vector<SourcePort::AssetVertex>& CNativeGeom::edit(std::size_t sector) {
     return at->second;
 }
 void CNativeGeom::bounds(){
+    sphere_from_bounds_=true;
     city_prop_extent_=-1;
     model_cull_valid_=false;world_sphere_dirty_=true;box_.Reset();bool any=false;
     if(asset_)for(auto s:sectors_)for(std::size_t i=0;i<vertex_count(s);++i){const auto v=vertex(s,i);Mth::Vector p(v.position[0],v.position[1],v.position[2],1);Dbg_Assert(finite(p));box_.AddPoint(p);any=true;}
@@ -506,7 +584,7 @@ void CNativeGeom::copy_state(CNativeGeom& dest,bool instance)const{
     // Source streams are immutable; all writable streams and state below are
     // copied per geom, including non-instance clones used by the real editor.
     dest.asset_=asset_;dest.sectors_=sectors_;dest.cas_=cas_;dest.dictionary_=dictionary_;dest.model_=model_;dest.lights_=lights_;
-    dest.transform_=transform_;dest.scale_=scale_;dest.box_=box_;dest.sphere_=sphere_;dest.model_cull_sphere_=model_cull_sphere_;dest.model_cull_valid_=model_cull_valid_;dest.model_pose_=model_pose_;dest.direct_bones_=direct_bones_;dest.overrides_=overrides_;dest.edited_=edited_;dest.render_colors_=render_colors_;
+    dest.transform_=transform_;dest.scale_=scale_;dest.box_=box_;dest.sphere_=sphere_;dest.sphere_from_bounds_=sphere_from_bounds_;dest.model_cull_sphere_=model_cull_sphere_;dest.model_cull_valid_=model_cull_valid_;dest.model_pose_=model_pose_;dest.direct_bones_=direct_bones_;dest.overrides_=overrides_;dest.edited_=edited_;dest.render_colors_=render_colors_;
     dest.color_=color_;dest.color_set_=color_set_;dest.active_=active_;dest.sky_=sky_;dest.billboard_=billboard_;dest.dictionary_only_=false;dest.explicit_uv_=explicit_uv_;dest.visibility_=visibility_;dest.hide_mask_=hide_mask_;
     dest.wibble_=wibble_;dest.custom_wibble_=custom_wibble_;dest.uv_offset_=uv_offset_;dest.m_multipleColorsEnabled=m_multipleColorsEnabled;dest.m_cloned=instance?vINSTANCE:vCOPY;dest.shadow_enabled_=shadow_enabled_;
 }
@@ -620,13 +698,19 @@ const CNativeGeom::RenderMeshCache& CNativeGeom::render_mesh(RenderMeshCache& ca
     // Create-a-Deck uses two accessory slots on the base graphic itself.
     // Retail exports these textures with the environment flag also set.
     const auto& material=asset_->materials[cache.material];
-    cache.deck_overlays=0;
+    cache.overlay_passes=0;
     for(unsigned i=1;i<material.passes.size()&&i<4;++i){
         unsigned mapped;
         if(pass_match(material,0x55c293b6,i,mapped)&&mapped==i&&
-           (material.passes[i].texture==0x55528610||material.passes[i].texture==0x11ecfc38))
-            cache.deck_overlays|=1u<<i;
+           is_deck_sticker_slot(material.passes[i].texture))
+            cache.overlay_passes|=1u<<i;
     }
+    // The call button is a decal on a second sheet of brushed metal.
+    // Its own UV set aligns the lettering with the elevator controls.
+    if(material.passes.size()==3 && material.passes[0].texture==0x9753b1a0 &&
+       solid_reflection_surface(material) && material.passes[2].texture==0x28fefff8 &&
+       material.passes[2].flags==0x24 && (material.passes[2].alpha&0xffffff)==5)
+        cache.overlay_passes|=1u<<2;
     cache.base_pass=passes.diffuse;cache.blend_pass=passes.opacity;
     cache.indices=std::make_shared<const std::vector<uint16>>(std::move(cache.topology.triangles));
     cache.mask=hide_mask_;cache.lod=lod;cache.valid=true;cache.facing_ready=false;cache.attributes_revision=cache.bounds_revision=0;cache.retained.reset();
@@ -722,6 +806,10 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
             const float near_actor_range=bound[3]+near_actor_margin;
             if((bound-view.position).LengthSqr()>near_actor_range*near_actor_range&&
                !SourcePort::SphereInFrustum(view,bound))return;
+        }else if(view.refine_static_leaves && partitioned_ && !frustum_mask && sphere_from_bounds_ && view.occlusion){
+            // The cell contains the authored sphere center and is inside all
+            // frustum planes. A replacement sphere still takes the full test.
+            if(view.occluder_mask && view.occlusion->HidesSphere(bound,bound[3],view.occluder_mask))return;
         }else if(!SourcePort::SphereVisible(view,bound))return;
     }
     const bool performance=view.performance&&!snapshot;
@@ -885,10 +973,10 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
             const unsigned blend_pass=cache?cache->blend_pass:0;
             if(performance&&blend_pass==material->passes.size())continue; // reflection-only layer contributes nothing without reflections
             const unsigned base_pass=cache&&!raw_colors&&!projection_receiver?cache->base_pass:blend_pass;
-            const auto deck_overlays=cache&&!raw_colors&&!projection_receiver?cache->deck_overlays:0;
+            const auto overlay_passes=cache&&!raw_colors&&!projection_receiver?cache->overlay_passes:0;
             bool billboard=source->flags&0x00800000;
             bool need_normals=!performance||billboard;
-            bool immutable=performance&&!deck_overlays&&view.retain_static&&!model_&&bones_.empty()&&!billboard&&!raw_colors&&!projection_receiver&&!custom_wibble_
+            bool immutable=performance&&!overlay_passes&&view.retain_static&&!model_&&bones_.empty()&&!billboard&&!raw_colors&&!projection_receiver&&!custom_wibble_
                 &&material->color_wibble.empty();
             if(immutable)immutable=!(material->passes[base_pass].flags&(1|2|(1<<11)));
             if(original_scenery&&immutable&&view.backface_static&&bounds_view->frustum_positive_winding&&
@@ -908,13 +996,28 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
             }
             if(immutable&&cache->revision==render_revision_){if(auto saved=cache->retained.lock()){
                 if(view.detail_stats)++view.detail_stats->retained_hits;
-                SourcePort::WorldBatch batch;static_cast<SourcePort::WorldDrawState&>(batch)=*saved;
-                // Texture objects can be reloaded independently of a sector. Resolve the
-                // original dictionary key again; never retain a raw sampler owner.
-                batch.texture=nullptr;auto texture=material->passes[base_pass].texture;if(texture){Dbg_Assert(dictionary_);batch.texture=SourcePort::world_texture(view,*dictionary_,texture);Dbg_Assert(batch.texture);}
-                batch.indices=saved->indices;batch.retained=std::move(saved);batch.distance=distance_squared;batch.group=out.size();
-                if(view.group_static_materials&&static_materials_&&batch.opaque)static_materials_->Bind(batch,cache->material);
-                out.push_back(std::move(batch));continue;}}
+                const auto group=out.size();
+                auto prepare_batch=[&](SourcePort::WorldBatch& batch){
+                    static_cast<SourcePort::WorldDrawState&>(batch)=*saved;
+                    // A material survives a dictionary edit independently of its sampler.
+                    batch.texture=nullptr;
+                    const auto texture=material->passes[base_pass].texture;
+                    if(texture){
+                        Dbg_Assert(dictionary_);
+                        batch.texture=SourcePort::world_texture(view,*dictionary_,texture);
+                        Dbg_Assert(batch.texture);
+                    }
+                    batch.indices=saved->indices;batch.retained=std::move(saved);
+                    batch.distance=distance_squared;batch.group=group;
+                    if(view.group_static_materials&&static_materials_&&batch.opaque)static_materials_->Bind(batch,cache->material);
+                };
+                if(view.refine_static_leaves)prepare_batch(out.emplace_back());
+                else{
+                    SourcePort::WorldBatch batch;
+                    prepare_batch(batch);
+                    out.push_back(std::move(batch));
+                }
+                continue;}}
 
             std::vector<Mth::Vector> positions,normals;
             auto pose_on_cpu=[&]{
@@ -948,7 +1051,7 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
             // Effects that need posed normals still use the CPU.
             const bool skin_pilot=asset_->moscow_guard_skin||(local_player&&view.test_player_skin)||
                 (view.city_stereo_fast&&asset_->pedestrian_skin&&model_);
-            bool use_skin=view.gpu_skin&&!deck_overlays&&performance&&skin_pilot&&
+            bool use_skin=view.gpu_skin&&!overlay_passes&&performance&&skin_pilot&&
                 cache&&source==&original&&!billboard&&!need_normals&&
                 !raw_colors&&!projection_receiver&&view.index_skinned&&!bones_.empty()&&
                 (source->flags&16)&&!custom_wibble_&&!explicit_uv_&&material->color_wibble.empty()&&
@@ -967,10 +1070,10 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
                 if(projection_receiver&&pi)break;
                 const bool overlay=performance&&pi!=base_pass;
                 if(overlay){
-                    if(!deck_overlays)break;
-                    if(!(deck_overlays&(1u<<pi)))continue;
+                    if(!overlay_passes)break;
+                    if(!(overlay_passes&(1u<<pi))||!dictionary_)continue;
                     const auto* slot=SourcePort::world_texture(view,*dictionary_,pass.texture);
-                    if(!slot||!slot->Asset().image)continue;
+                    if(!slot||(is_deck_sticker_slot(pass.texture)&&!slot->Asset().image))continue;
                 }
                 SourcePort::SetWorldMaterialState(batch,*material,pi,base_pass,blend_pass,sky_,performance,mesh.flags&2);
                 if(overlay){batch.pass=pi;batch.opaque=false;batch.environment=false;}
@@ -1140,6 +1243,13 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
                     auto saved=std::make_shared<SourcePort::StaticWorldMesh>();
                     static_cast<SourcePort::WorldDrawState&>(*saved)=static_cast<const SourcePort::WorldDrawState&>(batch);
                     saved->vertices=std::move(batch.vertices);saved->indices=batch.indices;saved->owner=render_owner_;saved->serial=++static_mesh_serial;
+                    if(view.prepare_source_strips && original_scenery && cache==full_cache && index_static &&
+                       batch.opaque && batch.depth_write && !batch.pass && !batch.environment && !batch.z_bias &&
+                       !hide_mask_ && material->passes.size()==1 && !material->grass && triangles.size()>=192){
+                        const auto& strip=mesh.lods[cache->lod];
+                        if(strip.size()<=SOURCE_DRAW_SLICE_ELEMENTS && strip.size()<triangles.size())
+                            saved->source_strip=SourcePort::CompactSourceStrip(strip,cache->topology.vertices,triangles);
+                    }
                     if(cull_mesh){
                         saved->box_center=full_cache->box_center;
                         saved->box_half_size=full_cache->box_half_size;

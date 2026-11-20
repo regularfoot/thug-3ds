@@ -20,6 +20,14 @@ bool compare_city_options = false;
 bool moscow_turn_trial = false;
 bool compare_release_turn = false;
 bool compare_stereo_turns = false, manhattan_turn = false;
+bool dense_draw_trial=false, dense_walls=false, dense_reference=false;
+bool paired_dense_walls=false, reverse_dense_walls=false;
+bool tail_trial=false, reverse_effects=false, keep_buffers=false;
+bool cpu_trial=false,reverse_cpu=false,cpu_fast=false;
+bool overlap_trial=false,reverse_overlap=false,overlap_enabled=false;
+bool manhattan_frame_trial=false, reverse_manhattan_trial=false;
+unsigned manhattan_frame_options=0;
+bool compare_strips = false, reverse_strip_trial = false, source_strips = false;
 bool reuse_static_prefix = true;
 bool distant_ped_poses = true;
 bool compare_vancouver_ambient = false;
@@ -37,8 +45,30 @@ void read_startup_options(const std::string& root) {
     moscow_turn_trial = performance_route && marker("compare_moscow_turn.txt");
     manhattan_turn = moscow_turn_trial && marker("compare_manhattan_night.txt");
     compare_stereo_turns = moscow_turn_trial && (manhattan_turn || marker("compare_moscow_night.txt"));
+    dense_draw_trial=compare_stereo_turns && marker("compare_dense_draws.txt");
+    paired_dense_walls=dense_draw_trial && marker("paired_dense_walls.txt");
+    reverse_dense_walls=paired_dense_walls && marker("reverse_dense_walls.txt");
+    dense_reference=dense_draw_trial && marker("reference_without_walls.txt");
+    tail_trial=dense_draw_trial || (manhattan_turn && marker("trace_manhattan_tail.txt"));
+    dense_walls=dense_draw_trial ? marker("dense_wall_candidates.txt") : !marker("legacy_dense_walls.txt");
+    reverse_effects=tail_trial && marker("reverse_tail_effects.txt");
+    keep_buffers=tail_trial ? marker("keep_turn_buffers.txt") : !marker("legacy_turn_buffers.txt");
+    cpu_trial=!tail_trial && manhattan_turn && marker("compare_city_cpu.txt");
+    reverse_cpu=cpu_trial && marker("reverse_city_cpu.txt");
+    cpu_fast=!marker("legacy_city_cpu.txt");
+    overlap_trial=!tail_trial && !cpu_trial && manhattan_turn && marker("compare_frame_overlap.txt");
+    reverse_overlap=overlap_trial && marker("reverse_frame_overlap.txt");
+    overlap_enabled=marker("frame_overlap.txt");
+    manhattan_frame_trial=!tail_trial && !cpu_trial && !overlap_trial && manhattan_turn && marker("compare_manhattan_frame.txt");
+    reverse_manhattan_trial=manhattan_frame_trial && marker("reverse_manhattan_frame.txt");
+    manhattan_frame_options=unsigned(marker("wide_static_materials.txt")) | (unsigned(marker("frame_core2.txt"))<<1);
+    compare_strips = !tail_trial && !cpu_trial && !overlap_trial && !manhattan_frame_trial && compare_stereo_turns && marker("compare_source_strips.txt");
+    reverse_strip_trial = compare_strips && marker("reverse_strip_trial.txt");
+    source_strips = marker("source_strips.txt");
     // The test save unlocks both classic levels in the regular Free Skate menu.
     trial_level = compare_stereo_turns ? (manhattan_turn ? 1 : 7) : -1;
+    if (dense_draw_trial && marker("trial_hawaii.txt")) trial_level = 4;
+    if (dense_draw_trial && marker("trial_vancouver.txt")) trial_level = 5;
     if (performance_route && marker("trial_school_ii.txt")) trial_level = 10;
     if (performance_route && marker("trial_venice.txt")) trial_level = 11;
     compare_release_turn = moscow_turn_trial && marker("compare_moscow_release.txt");
@@ -75,12 +105,59 @@ void read_startup_options(const std::string& root) {
 const char* StartupSaveName() { return startup_save.c_str(); }
 bool SkipOpeningMovies() { return skip_opening; }
 bool HideVancouverAmbient() { return hide_vancouver_ambient; }
-bool UseOptimizedFramePath(unsigned step){
-    if(!compare_stereo_turns)return !moscow_turn_trial;
+static bool second_turn_variant(unsigned step){
     if(!step || step>1080)return true;
     if(step==5)return true; // warm-up visual check paired with step 4
     constexpr bool abba[]={false,true,true,false,false,true,true,false,false,true,true,false};
     return abba[(step-1)/90];
+}
+bool CityTailTrial(){return tail_trial;}
+const char* DenseDrawScene(){
+    if(!dense_draw_trial)return nullptr;
+    switch(trial_level){
+        case 1:return "NY";
+        case 4:return "HI";
+        case 5:return "VC";
+        case 7:return "RU";
+        default:return nullptr;
+    }
+}
+bool DenseWallReference(){return dense_reference;}
+bool UseDenseWalls(bool level_default,unsigned step){
+    // Only enable the extra tests by default on levels where the camera
+    // comparison demonstrated a benefit.
+    if(dense_reference)return false;
+    if(paired_dense_walls)return step && step<=1080 && (second_turn_variant(step)!=reverse_dense_walls);
+    return dense_walls && (dense_draw_trial || (level_default && !moscow_turn_trial));
+}
+bool KeepTurnBuffers(){return keep_buffers && (tail_trial || !moscow_turn_trial);}
+bool OmitTurnEffects(unsigned step){
+    return tail_trial && !dense_draw_trial && step && step<=1080 && (((step-1)/90%4==1 || (step-1)/90%4==2)!=reverse_effects);
+}
+bool CompareCityCpu(){return cpu_trial;}
+bool CityCpuFast(unsigned step){
+    if(!cpu_trial)return cpu_fast && (tail_trial || !moscow_turn_trial);
+    return step && step<=1080 && (second_turn_variant(step)!=reverse_cpu);
+}
+bool CompareFrameOverlap(){return overlap_trial;}
+bool FrameOverlapEnabled(unsigned step){
+    if(!overlap_trial)return overlap_enabled;
+    if(step==0||step>1080)return false;
+    return second_turn_variant(step)!=reverse_overlap;
+}
+bool CompareManhattanFrame(){return manhattan_frame_trial;}
+unsigned ManhattanFrameOptions(unsigned step){
+    if(!manhattan_frame_trial)return manhattan_frame_options;
+    if(!step || step>1080)return 0;
+    constexpr unsigned order[]={0,1,3,2,1,2,0,3,2,3,1,0};
+    const unsigned mode=order[(step-1)/90];
+    return reverse_manhattan_trial?3-mode:mode;
+}
+bool CompareSourceStrips(){return compare_strips;}
+bool SourceStripsEnabled(unsigned step){return compare_strips ? (second_turn_variant(step) != reverse_strip_trial) : source_strips;}
+bool UseOptimizedFramePath(unsigned step){
+    if(tail_trial||cpu_trial||compare_strips||manhattan_frame_trial||overlap_trial)return true;
+    return compare_stereo_turns ? second_turn_variant(step) : !moscow_turn_trial;
 }
 int FreeSkateTrialLevel(){return trial_level;}
 bool ManhattanTurnTrial(){return manhattan_turn;}

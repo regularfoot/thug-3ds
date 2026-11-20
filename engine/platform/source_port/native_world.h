@@ -1,5 +1,6 @@
 #pragma once
 #include <source_port/mesh_assets.h>
+#include <source_port/thread_os.h>
 #include <source_port/native_texture.h>
 #include <source_port/native_lighting.h>
 #include <gfx/nxgeom.h>
@@ -12,11 +13,16 @@ namespace SourcePort {
 class WorldOcclusion;
 class WorldMeshRetention;
 class WorldTextureLookup;
-struct WorldDetailStats {unsigned shared_positions=0,ped_visible=0,ped_far=0,ped_samples=0,ped_replays=0,distant_prop_sectors=0,texture_hits=0,texture_misses=0,local_parts=0,local_triangles=0,local_array_parts=0,meshes=0,triangles=0,lod_meshes=0,lod_triangles_saved=0,partition_skipped=0,material_meshes=0,material_groups=0,range_meshes=0,range_triangles=0,backface_meshes=0,backface_triangles=0,occluded_sectors=0,skin_draws=0,retained_hits=0,retained_builds=0;uint64 pose_ticks=0,gather_ticks=0,sort_ticks=0,coalesce_ticks=0,group_ticks=0;};
+struct WorldDetailStats {unsigned worker_items=0;unsigned shared_positions=0,ped_visible=0,ped_far=0,ped_samples=0,ped_replays=0,distant_prop_sectors=0,texture_hits=0,texture_misses=0,local_parts=0,local_triangles=0,local_array_parts=0,meshes=0,triangles=0,lod_meshes=0,lod_triangles_saved=0,partition_skipped=0,material_meshes=0,material_groups=0,range_meshes=0,range_triangles=0,backface_meshes=0,backface_triangles=0,occluded_sectors=0,skin_draws=0,retained_hits=0,retained_builds=0;uint64 pose_ticks=0,gather_ticks=0,sort_ticks=0,coalesce_ticks=0,group_ticks=0;};
 struct AmbientEffectCounts {
     unsigned fountain_visible=0,fountain_elements=0,weather_elements=0,legacy_elements=0,other_particle_elements=0;
 };
 struct WorldView {
+    SourceFrameWorker* sort_worker=nullptr;
+    bool wide_static_groups=false;
+    bool refine_static_leaves=false, keep_turn_buffers=false;
+    std::vector<uint64>* upload_trace=nullptr;
+    bool prepare_source_strips=false, use_source_strips=false;
     bool prune_occluders=false, city_stereo_fast=false;
     unsigned occluder_mask=~0u;
     bool defer_cold_runs=false, group_opaque_disjoint=false, reuse_pose_vertices=false;
@@ -60,6 +66,7 @@ struct WorldDrawState {
 struct StaticWorldMesh:WorldDrawState {
     std::vector<SourceRenderVertex> vertices;
     std::shared_ptr<const std::vector<uint16>> indices;
+    std::vector<uint16> source_strip;
     std::weak_ptr<const uint8> owner;
     uint64 serial=0;
     // Only immutable, frustum-tested geometry can be moved across draws.
@@ -123,9 +130,9 @@ private:
     std::vector<std::pair<uint32,uint32>> material_indices_;
     uint32 groups_=0;
 };
-struct WorldResidencyStats {std::size_t bytes=0,meshes=0,hits=0,uploads=0,evictions=0,streamed=0,draws=0,stream_vertices=0,stream_uploads=0,indexed_meshes=0,static_indexed_runs=0,stream_indices=0,budget=0,prefix_hits=0;};
+struct WorldResidencyStats {std::size_t bytes=0,meshes=0,hits=0,uploads=0,evictions=0,streamed=0,draws=0,stream_vertices=0,stream_uploads=0,indexed_meshes=0,static_indexed_runs=0,stream_indices=0,budget=0,prefix_hits=0,strip_runs=0,strip_saved_indices=0;};
 constexpr std::size_t StaticWorldVertexBudget=4*1024*1024;
-std::size_t MoscowStaticWorldBudget(std::size_t resident_bytes,std::size_t linear_free,std::size_t arena_free);
+std::size_t CityStaticWorldBudget(std::size_t resident_bytes,std::size_t linear_free,std::size_t arena_free,bool keep_turn_buffers=false);
 struct WorldDrawRun {
     const WorldBatch* first=nullptr;
     std::size_t count=0;
@@ -133,12 +140,13 @@ struct WorldDrawRun {
     std::size_t retained_count=0,element_count=0;
     bool indexed=false;
     std::size_t transient_count=1;
+    bool source_strip=false;
     std::size_t IndexCount()const{return indexed?element_count:0;}
     std::size_t BatchCount()const{return retained_count?retained_count:transient_count;}
 };
 bool MatchesStaticRun(const std::vector<std::shared_ptr<const StaticWorldMesh>>& resident,
     bool resident_indexed,const WorldDrawRun& run,bool allow_prefix);
-std::vector<WorldDrawRun> BuildWorldDrawRuns(const std::vector<WorldBatch>&,bool merge_materials=true);
+std::vector<WorldDrawRun> BuildWorldDrawRuns(const std::vector<WorldBatch>&,bool merge_materials=true,bool ordered_streams=false);
 void AppendWorldDrawRun(const WorldDrawRun&,float u_scale,float v0,float v1,std::vector<SourceRenderVertex>&);
 bool AppendWorldStreamRun(const WorldDrawRun&,float u_scale,float v0,float v1,std::vector<SourceRenderVertex>&,std::vector<uint16>&,std::vector<SourceIndexRange>&,SourceDrawPacket&);
 struct WorldStreamWriter {
@@ -159,8 +167,9 @@ void PrepareWorldFrustum(WorldView&);
 float ConservativeSphereScale(const Mth::Matrix&);
 bool SphereVisible(const WorldView&,const Mth::Vector&);
 bool GatherNativeWorld(const WorldView&,uint32,std::vector<WorldBatch>&,bool group_opaque=false);
-bool SortWorldBatches(std::vector<WorldBatch>&,bool group_opaque,WorldDetailStats* detail=nullptr);
+bool SortWorldBatches(std::vector<WorldBatch>&,bool group_opaque,WorldDetailStats* detail=nullptr,SourceFrameWorker* worker=nullptr);
 void CoalesceOpaqueWorldBatches(std::vector<WorldBatch>&,std::size_t sorted_prefix=0);
+unsigned GroupStaticMaterialWindows(const WorldView&,std::vector<WorldBatch>&);
 unsigned GroupScreenDisjointWorldBatches(const WorldView&,std::vector<WorldBatch>&,bool merge_materials=true);
 void PrepareWorldMaterial(const WorldDrawState&,SourceDrawPacket&);
 void ReleaseNativeWorldRegistry();
@@ -177,7 +186,7 @@ public:
 private:
     struct Buffer {SourceGpuMesh* gpu=nullptr;std::size_t capacity=0,index_capacity=0;};
     Buffer streaming_;
-    struct Resident {std::vector<std::shared_ptr<const StaticWorldMesh>> meshes;SourceGpuMesh* gpu=nullptr;std::size_t capacity=0,index_capacity=0;float u_scale=1,v0=0,v1=1;uint64 last_seen=0;};
+    struct Resident {std::vector<std::shared_ptr<const StaticWorldMesh>> meshes;SourceGpuMesh* gpu=nullptr;std::size_t capacity=0,index_capacity=0;float u_scale=1,v0=0,v1=1;uint64 last_seen=0;bool source_strip=false;};
     using Residency = std::multimap<uint64,Resident>;
     Residency resident_;
     // A serial hints at the previous exact run. The multimap remains the
@@ -258,7 +267,7 @@ private:
         ~SkinMesh();
         bool UpdatePose(const std::vector<Mth::Matrix>&) const;
     };
-    struct RenderMeshCache {SourcePort::RenderTopology topology;uint32 mask=0;unsigned lod=0;std::size_t material=0;unsigned base_pass=0,blend_pass=0;uint8 deck_overlays=0;bool valid=false;
+    struct RenderMeshCache {SourcePort::RenderTopology topology;uint32 mask=0;unsigned lod=0;std::size_t material=0;unsigned base_pass=0,blend_pass=0;uint8 overlay_passes=0;bool valid=false;
         mutable std::vector<SourcePort::DrawVertexAttributes> attributes;mutable uint64 attributes_revision=0;
         mutable std::shared_ptr<const std::vector<uint16>> indices;
         mutable Mth::Vector box_center,box_half_size;
@@ -295,7 +304,8 @@ private:
     void plat_set_visibility(uint32 mask)override{visibility_=mask;}uint32 plat_get_visibility()const override{return visibility_;}
     void plat_set_active(bool on)override{active_=on;}bool plat_is_active()const override{return active_;}
     const Mth::CBBox& plat_get_bounding_box()const override;
-    void plat_set_bounding_sphere(const Mth::Vector& s)override{sphere_=s;model_cull_valid_=false;world_sphere_dirty_=true;}
+    bool sphere_from_bounds_=false;
+    void plat_set_bounding_sphere(const Mth::Vector& s)override{sphere_from_bounds_=false;sphere_=s;model_cull_valid_=false;world_sphere_dirty_=true;}
     const Mth::Vector plat_get_bounding_sphere()const override{return sphere_;}
     void plat_set_world_position(const Mth::Vector&)override;const Mth::Vector& plat_get_world_position()const override{return transform_[3];}
     void plat_set_orientation(const Mth::Matrix&)override;const Mth::Matrix& plat_get_orientation()const override{return transform_;}

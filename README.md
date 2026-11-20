@@ -1,12 +1,19 @@
 # thug-3ds
 
-An unofficial port of **Tony Hawk’s Underground** for the Nintendo 3DS. Version **0.1.1** appears as **THUG1 0312** in the Homebrew Launcher. The original game loop runs on ARM11, the PICA200 renders the graphics, and the game reads its assets from the SD card.
+An unofficial port of **Tony Hawk’s Underground** for the Nintendo 3DS. The current source build appears as **THUG1 0315** in the Homebrew Launcher. The original game loop runs on ARM11, the PICA200 renders the graphics, and the game reads its assets from the SD card.
 
 This repository contains the 3DS port code and build tools. To build a playable copy, you need **both** a supported PC installation (its `Game/Data` folder) and a compatible source checkout of the original engine that you have permission to use. The retail PC installation supplies the game assets.
 
 [Build and install in English](#build-and-install) · [Сборка и установка на русском](#сборка-и-установка)
 
-## What changed in 0.1.1
+## What changed in build 0315
+
+- Solid elevator doors in Hawaii now hide the buildings behind them. The call-button panels keep their markings.
+- The full lower façade and windows behind Moscow’s cannons are visible again. The renderer used to hide them when the camera faced the courtyard.
+- The same material correction covers solid surfaces in Manhattan’s subway, the Hawaii hotel and Wallows, and the backstage corridor in Hotter Than Hell. Transparent glass keeps its original blending.
+- The renderer also reuses static geometry while turning the camera in dense stereo views. Frame rate still depends on the level and camera direction.
+
+## Camera and controls (introduced in 0.1.1)
 
 | Console | Camera and controls |
 |---|---|
@@ -17,11 +24,11 @@ This release includes a fix for music cutting out a few seconds into a song in M
 
 ## Features and testing
 
-- Play Free Skate or Story, choose a skater, edit your skater and board, and save your progress. Stereoscopic 3D supports adjustable depth. A full Story playthrough on 0312 still needs testing.
+- Play Free Skate or Story, choose a skater, edit your skater and board, and save your progress. Stereoscopic 3D supports adjustable depth. A full Story playthrough on 0315 still needs testing.
 - The Activision, Neversoft, and game intro movies play at startup. Press **A** or **B** to skip the current movie, or **Start** to skip the remaining intros. Use `--autoload` when preparing the SD folder to load a personal save at startup.
 - On a physical **New 3DS**, build 0311 fixed the reported music dropouts. In Azahar, build 0312 completed 1,080 frames of skating in Moscow in stereo. On dense maps, frame rate varies with the direction the camera faces.
 - With the **Old 3DS** profile in Azahar, build 0312 loaded the School II scene and its collision data. Build 0310 was also tested skating in School II and Venice with the Old 3DS profile. For a first run, try **Free Skate → School II** in mono. Memory limits which large levels can run on this model.
-- Build 0312 passed 20 automated tests with AddressSanitizer and UndefinedBehaviorSanitizer, including tests for combined touch and physical input. The new controls still need testing on physical consoles.
+- For build 0315, the renderer was checked from five camera positions in Hawaii and five in Moscow in Azahar. The packaged build also reached gameplay in Moscow. All 20 host tests passed with AddressSanitizer and UndefinedBehaviorSanitizer, alongside 37 Python tests. The latest wall fixes await confirmation on physical hardware.
 
 ## Build and install
 
@@ -61,15 +68,15 @@ The ARM build produces `build/arm/thug1_full_engine.3dsx` and `build/arm/thug1_f
 python3 make_sd.py --data "/path/to/THUG/Game/Data" --sdk-image rethpsu-sdk:0.1
 ```
 
-The supported PC data directory contains 6,803 original files. The script verifies their contents, copies the assets, extracts the images needed by the skater editor, and prepares textures, simplified geometry, and smaller asset sets for Old 3DS. To carry over a save, add `--save-dir "/path/to/source-saves" --autoload "Kevin Baskin"` to the command and substitute your save’s exact in-game name. Each run needs a fresh output directory. If `out/3ds/thug1_source_engine_0312` already exists, move it aside first.
+The supported PC data directory contains 6,803 original files. The script verifies their contents, copies the assets, extracts the images needed by the skater editor, and prepares textures, simplified geometry, and smaller asset sets for Old 3DS. To carry over a save, add `--save-dir "/path/to/source-saves" --autoload "Kevin Baskin"` to the command and substitute your save’s exact in-game name. Each run needs a fresh output directory. If `out/3ds/thug1_source_engine_0315` already exists, move it aside first.
 
 ### 4. Install and play
 
-Allow about **3 GB** of free space on a FAT32 SD card. Copy the entire `out/3ds/thug1_source_engine_0312` folder into `/3ds/` on the card and select **THUG1 0312** in the Homebrew Launcher. The startup log is written to `source_engine_boot.txt` in the application folder. When reporting a crash, include the console model, mono or stereo mode, level, and what you were doing just before it happened.
+Allow about **3 GB** of free space on a FAT32 SD card. Copy the entire `out/3ds/thug1_source_engine_0315` folder into `/3ds/` on the card and select **THUG1 0315** in the Homebrew Launcher. The startup log is written to `source_engine_boot.txt` in the application folder. When reporting a crash, include the console model, mono or stereo mode, level, and what you were doing just before it happened.
 
 ### Upgrading from an earlier build
 
-Install `thug1_source_engine_0312` alongside the previous build. Copy your `source-saves/` folder and, if present, your `autoload_save.txt` into the new folder to keep your progress. Intro movies play by default. To skip them, place a file named `skip_opening.txt` in the new application folder.
+Install `thug1_source_engine_0315` alongside the previous build. Copy your `source-saves/` folder and, if present, your `autoload_save.txt` into the new folder to keep your progress. Intro movies play by default. To skip them, place a file named `skip_opening.txt` in the new application folder.
 
 ## Сборка и установка
 
@@ -109,13 +116,13 @@ ARM-сборка создаёт `build/arm/thug1_full_engine.3dsx` и `build/arm
 python3 make_sd.py --data "/path/to/THUG/Game/Data" --sdk-image rethpsu-sdk:0.1
 ```
 
-Проверенный каталог PC-игры содержит 6 803 исходных файла. Скрипт проверяет их содержимое, копирует ресурсы, извлекает недостающие изображения для редактора скейтера и готовит текстуры, упрощённую геометрию и наборы для Old 3DS. Для поддержки существующего прогресса добавьте к этой же команде параметры `--save-dir "/path/to/source-saves" --autoload "Kevin Baskin"`, подставив имя вашего сохранения из игры. Каждая сборка создаётся в новой папке. Если `out/3ds/thug1_source_engine_0312` уже существует, сначала переместите её в другое место.
+Проверенный каталог PC-игры содержит 6 803 исходных файла. Скрипт проверяет их содержимое, копирует ресурсы, извлекает недостающие изображения для редактора скейтера и готовит текстуры, упрощённую геометрию и наборы для Old 3DS. Для поддержки существующего прогресса добавьте к этой же команде параметры `--save-dir "/path/to/source-saves" --autoload "Kevin Baskin"`, подставив имя вашего сохранения из игры. Каждая сборка создаётся в новой папке. Если `out/3ds/thug1_source_engine_0315` уже существует, сначала переместите её в другое место.
 
-**4. Запустите игру.** Скопируйте `out/3ds/thug1_source_engine_0312` в `/3ds/` на карте FAT32. Оставьте около **3 ГБ** свободного места. В Homebrew Launcher выберите **THUG1 0312**. Журнал запуска появляется рядом с игрой в `source_engine_boot.txt`. Для сообщения об ошибке укажите модель консоли, режим моно/стерео, уровень и действие перед сбоем.
+**4. Запустите игру.** Скопируйте `out/3ds/thug1_source_engine_0315` в `/3ds/` на карте FAT32. Оставьте около **3 ГБ** свободного места. В Homebrew Launcher выберите **THUG1 0315**. Журнал запуска появляется рядом с игрой в `source_engine_boot.txt`. Для сообщения об ошибке укажите модель консоли, режим моно/стерео, уровень и действие перед сбоем.
 
 ### Если у вас уже есть предыдущая сборка
 
-Установите папку `thug1_source_engine_0312` рядом с прежней. Чтобы продолжить игру, скопируйте свою папку `source-saves/` и, если он у вас есть, файл `autoload_save.txt` в папку 0312. Вступление включено по умолчанию. Файл `skip_opening.txt` в папке новой версии включает его пропуск.
+Установите папку `thug1_source_engine_0315` рядом с прежней. Чтобы продолжить игру, скопируйте свою папку `source-saves/` и, если он у вас есть, файл `autoload_save.txt` в папку 0315. Вступление включено по умолчанию. Файл `skip_opening.txt` в папке новой версии включает его пропуск.
 
 ## License and third-party components
 

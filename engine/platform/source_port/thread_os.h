@@ -13,6 +13,12 @@ SourceThreadOS* source_thread_create(SourceThreadEntry entry, void* context,
 int source_thread_start(SourceThreadOS* thread, void* argument);
 int source_thread_join(SourceThreadOS* thread);
 int source_thread_destroy(SourceThreadOS* thread);
+typedef struct SourceFrameWorker SourceFrameWorker;
+SourceFrameWorker* source_frame_worker_create(void);
+int source_frame_worker_core(const SourceFrameWorker*);
+void source_frame_worker_submit(SourceFrameWorker*, void (*job)(void*), void* input);
+void source_frame_worker_wait(SourceFrameWorker*);
+void source_frame_worker_destroy(SourceFrameWorker*);
 int source_thread_is_controller(void);
 void source_thread_sleep_ms(unsigned milliseconds);
 #ifdef __cplusplus

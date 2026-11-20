@@ -9,12 +9,13 @@
 #include <cstring>
 #include <cmath>
 #include <tuple>
+#include <optional>
 #include <source_port/memory.h>
 namespace SourcePort {
 bool WorldMeshRetention::Remember(std::shared_ptr<const StaticWorldMesh> mesh){
     if(!mesh||mesh->owner.expired())return false;
     const auto bytes=sizeof(StaticWorldMesh)+mesh->vertices.capacity()*sizeof(SourceRenderVertex)+
-        (mesh->indices?mesh->indices->capacity()*sizeof(uint16):0);
+        (mesh->indices?mesh->indices->capacity()*sizeof(uint16):0)+mesh->source_strip.capacity()*sizeof(uint16);
     if(bytes>budget_)return false;
     while(!entries_.empty()&&(entries_.front().mesh->owner.expired()||bytes>budget_-bytes_)){
         bytes_-=entries_.front().bytes;
@@ -81,7 +82,7 @@ bool compare_draw_tail(const WorldBatch& a,const WorldBatch& b,std::size_t i,std
     return i<j;
 }
 
-bool sort_material_groups(std::vector<WorldBatch>& batches,WorldDetailStats* detail){
+bool sort_material_groups(std::vector<WorldBatch>& batches,WorldDetailStats* detail,SourceFrameWorker* worker){
     const StaticWorldMaterials* plan=nullptr;
     std::size_t planned=0;
     for(const auto& batch:batches){
@@ -108,15 +109,6 @@ bool sort_material_groups(std::vector<WorldBatch>& batches,WorldDetailStats* det
         if(first!=second)return first<second;
         return compare_draw_tail(a,b,i,j);
     };
-    unsigned visible_groups=0;
-    auto start=grouped.begin();
-    for(std::size_t group=0;group<group_count;++group){
-        const auto end=grouped.begin()+ends[group];
-        if(start==end)continue;
-        ++visible_groups;
-        if(!std::is_sorted(start,end,within_group))std::sort(start,end,within_group);
-        start=end;
-    }
     const auto compare=[&](std::size_t i,std::size_t j){
         const auto& a=batches[i];const auto& b=batches[j];
         if(a.sky!=b.sky)return a.sky;
@@ -128,7 +120,26 @@ bool sort_material_groups(std::vector<WorldBatch>& batches,WorldDetailStats* det
         if(a.draw_order!=b.draw_order)return a.draw_order<b.draw_order;
         return compare_draw_tail(a,b,i,j);
     };
-    std::sort(other.begin(),other.end(),compare);
+    // Each side sorts its own index array. Both read a frozen world snapshot.
+    // No allocations, shared_ptr updates or renderer state writes on core 2.
+    auto sort_other=[&]{std::sort(other.begin(),other.end(),compare);};
+    const bool parallel=worker && other.size()>=64 && planned>=64;
+    if(parallel){
+        source_frame_worker_submit(worker,[](void* job){(*static_cast<decltype(sort_other)*>(job))();},&sort_other);
+    }
+    unsigned visible_groups=0;
+    auto start=grouped.begin();
+    for(std::size_t group=0;group<group_count;++group){
+        const auto end=grouped.begin()+ends[group];
+        if(start==end)continue;
+        ++visible_groups;
+        if(!std::is_sorted(start,end,within_group))std::sort(start,end,within_group);
+        start=end;
+    }
+    if(parallel){
+        source_frame_worker_wait(worker);
+        if(detail)detail->worker_items+=other.size();
+    }else sort_other();
     // Merge from the back into the unused suffix; grouped remains a sorted
     // input even if all dynamic draws come before it.
     auto left=planned,right=other.size(),write=grouped.size();
@@ -192,7 +203,7 @@ void StaticWorldMaterials::Bind(WorldBatch& batch,std::size_t material)const{
     }
 }
 
-bool SortWorldBatches(std::vector<WorldBatch>& batches,bool group_opaque,WorldDetailStats* detail){
+bool SortWorldBatches(std::vector<WorldBatch>& batches,bool group_opaque,WorldDetailStats* detail,SourceFrameWorker* worker){
     if(batches.size()<2)return true;
     // The normal fast path has only depth-writing base passes in the
     // opaque world. A non-sortable draw must retain its old position.
@@ -210,7 +221,7 @@ bool SortWorldBatches(std::vector<WorldBatch>& batches,bool group_opaque,WorldDe
         });
         return false;
     }
-    if(sort_material_groups(batches,detail))return true;
+    if(sort_material_groups(batches,detail,worker))return true;
     struct Key {
         WorldMaterialKey material;
         uint64 identity;
@@ -309,6 +320,111 @@ bool reorderable(const WorldBatch& batch,bool opaque){
     return (!batch.opaque||opaque)&&batch.retained&&base_depth_draw(batch)&&!batch.camera_relative&&!batch.environment
         &&batch.retained->box_half_size[X]>=0;
 }
+}
+// Each node keeps an entire already-batched run. Draws whose conservative
+// two-eye rectangles overlap keep their original order, including equal depth.
+unsigned GroupStaticMaterialWindows(const WorldView& view,std::vector<WorldBatch>& batches){
+    constexpr unsigned limit=24;
+    const float horizontal=1/std::tan(view.hfov*float(Mth::PI)/360.f);
+    if(!std::isfinite(horizontal)||horizontal<=0||!(view.aspect>0))return 0;
+    const ScreenProjector projector{view,horizontal,horizontal*view.aspect};
+    struct Node {
+        std::size_t first,end,elements;
+        unsigned material=0,dependencies=0;
+        ScreenBounds rect;
+    };
+    std::array<Node,limit> nodes;
+    std::array<unsigned,limit> order,members;
+    std::array<std::optional<WorldMaterialKey>,limit> keys;
+    std::array<unsigned,64> slots;
+    std::vector<std::size_t> permutation;
+    unsigned saved=0;
+    for(std::size_t begin=0;begin<batches.size();){
+        if(!reorderable(batches[begin],true)){++begin;continue;}
+        unsigned count=0,materials=0;
+        std::size_t end=begin;
+        members.fill(0);
+        slots.fill(limit);
+        while(count<limit && end<batches.size() && batches[end].opaque==batches[begin].opaque && reorderable(batches[end],true)){
+            auto& n=nodes[count];
+            n={end,end+1,batches[end].ElementCount()};
+            const auto& first=batches[end++];
+            while(end<batches.size() && reorderable(batches[end],true) &&
+                  append_retained(first,n.elements,batches[end],true)){
+                n.elements+=batches[end++].ElementCount();
+            }
+            n.end=end;
+            const WorldMaterialKey key(first,true);
+            const auto texture=reinterpret_cast<std::uintptr_t>(first.texture)>>3;
+            unsigned slot=(texture^(texture>>11)^(first.blend*37u+first.cutoff*17u+key.flags))&(slots.size()-1);
+            while(slots[slot]!=limit && !(*keys[slots[slot]]==key))slot=(slot+1)&(slots.size()-1);
+            if(slots[slot]==limit){slots[slot]=materials;keys[materials++]=key;}
+            const auto material=slots[slot];
+            n.material=material;
+            members[material]|=1u<<count;
+            ++count;
+        }
+        if(materials<count && count>=3){
+            for(unsigned i=0;i<count;++i){
+                auto& n=nodes[i];
+                n.rect=projector.bounds(*batches[n.first].retained);
+                for(auto k=n.first+1;k<n.end&&n.rect.valid;++k){
+                    const auto r=projector.bounds(*batches[k].retained);
+                    n.rect.valid=r.valid;
+                    n.rect.left=std::min(n.rect.left,r.left);n.rect.right=std::max(n.rect.right,r.right);
+                    n.rect.bottom=std::min(n.rect.bottom,r.bottom);n.rect.top=std::max(n.rect.top,r.top);
+                }
+                for(unsigned j=0;j<i;++j)
+                    if(!n.rect.disjoint(nodes[j].rect))n.dependencies|=1u<<j;
+            }
+            unsigned pending=(1u<<count)-1,ready=0,active=limit;
+            for(unsigned pos=0;pos<count;++pos){
+                for(unsigned bits=pending&~ready;bits;bits&=bits-1){
+                    const unsigned i=__builtin_ctz(bits);
+                    if(!(nodes[i].dependencies&pending))ready|=1u<<i;
+                }
+                // Continue the last material when possible. Otherwise open the
+                // material with the largest ready set, breaking ties in source order.
+                unsigned choices=active<materials?(ready&members[active]):0;
+                if(!choices){
+                    unsigned best=0;
+                    for(unsigned bits=ready;bits;){
+                        const unsigned peers=ready&members[nodes[__builtin_ctz(bits)].material];
+                        const unsigned size=__builtin_popcount(peers);
+                        if(size>best){best=size;choices=peers;}
+                        bits&=~peers;
+                    }
+                }
+                const auto i=unsigned(__builtin_ctz(choices));
+                order[pos]=i;
+                active=nodes[i].material;
+                ready&=~(1u<<i);pending&=~(1u<<i);
+            }
+            auto calls=[&](bool reordered){
+                unsigned draws=0,material=limit;
+                std::size_t elements=0;
+                auto slices=[](std::size_t n){return unsigned((n+SOURCE_DRAW_SLICE_ELEMENTS-1)/SOURCE_DRAW_SLICE_ELEMENTS);};
+                for(unsigned pos=0;pos<count;++pos){
+                    const auto& n=nodes[reordered?order[pos]:pos];
+                    if(n.material!=material || elements+n.elements>32760){draws+=slices(elements);elements=0;}
+                    material=n.material;elements+=n.elements;
+                }
+                return draws+slices(elements);
+            };
+            const auto old=calls(false),next=calls(true);
+            if(next<old){
+                saved+=old-next;
+                permutation.clear();
+                for(unsigned pos=0;pos<count;++pos){
+                    const auto& n=nodes[order[pos]];
+                    for(auto i=n.first;i<n.end;++i)permutation.push_back(i-begin);
+                }
+                ApplyPayloadOrder(batches,begin,permutation,[](auto& i)->auto&{return i;});
+            }
+        }
+        begin=end;
+    }
+    return saved;
 }
 unsigned GroupScreenDisjointWorldBatches(const WorldView& view,std::vector<WorldBatch>& batches,bool merge_materials){
     if(batches.size()<2)return 0;
@@ -423,7 +539,7 @@ unsigned GroupScreenDisjointWorldBatches(const WorldView& view,std::vector<World
     ApplyPayloadOrder(batches,start,order,[](auto& index)->auto&{return index;});
     return original-grouped;
 }
-static void build_world_draw_runs(const std::vector<WorldBatch>& batches,bool merge_materials,
+static void build_world_draw_runs(const std::vector<WorldBatch>& batches,bool merge_materials,bool ordered_streams,
                                  std::vector<WorldDrawRun>& runs){
     runs.clear();
     runs.reserve(batches.size());
@@ -446,10 +562,12 @@ static void build_world_draw_runs(const std::vector<WorldBatch>& batches,bool me
             // the same indexed/array mode. Do not cross pass or blend bands.
             const auto& first=*previous.first;
             const bool indexed_pair=previous.indexed&&batch.GpuIndexed();
-            const bool array_pair=!previous.indexed&&!batch.GpuIndexed()&&(first.expand_on_upload||batch.expand_on_upload);
+            const bool array_pair=!previous.indexed&&!batch.GpuIndexed()&&
+                (ordered_streams||first.expand_on_upload||batch.expand_on_upload);
             const std::size_t limit=indexed_pair?SOURCE_DRAW_SLICE_ELEMENTS:32760;
             if(merge_materials&&(indexed_pair||array_pair)&&!first.retained&&!batch.retained&&!first.skin_mesh&&!batch.skin_mesh&&
-               sortable(first)&&sortable(batch)&&first.draw_order==batch.draw_order&&
+               first.opaque==batch.opaque&&(ordered_streams||first.opaque)&&base_depth_draw(first)&&base_depth_draw(batch)&&
+               !first.environment&&!batch.environment&&first.draw_order==batch.draw_order&&
                WorldMaterialKey(first,indexed_pair)==WorldMaterialKey(batch,indexed_pair)&&elements<=limit&&
                previous.element_count<=limit-elements&&count<=65536&&previous.count<=65536-count){
                 ++previous.transient_count;
@@ -473,9 +591,9 @@ bool MatchesStaticRun(const std::vector<std::shared_ptr<const StaticWorldMesh>>&
     }
     return true;
 }
-std::vector<WorldDrawRun> BuildWorldDrawRuns(const std::vector<WorldBatch>& batches,bool merge_materials){
+std::vector<WorldDrawRun> BuildWorldDrawRuns(const std::vector<WorldBatch>& batches,bool merge_materials,bool ordered_streams){
     std::vector<WorldDrawRun> runs;
-    build_world_draw_runs(batches,merge_materials,runs);
+    build_world_draw_runs(batches,merge_materials,ordered_streams,runs);
     return runs;
 }
 namespace {
@@ -533,6 +651,11 @@ bool WorldStreamWriter::Append(const WorldDrawRun& run,float us,float v0,float v
         errno=EINVAL;
         return false;
     }
+    if(run.source_strip && (!run.indexed || !run.first || run.retained_count!=1 || !run.first->retained ||
+                            !run.first->indices || run.first->retained->source_strip.size()!=needed_indices || needed_indices<3)){
+        errno=EINVAL;
+        return false;
+    }
     if(run.indexed){
         std::fill(indices+index_count,indices+index_first,uint16(0));
         auto index=index_first;
@@ -544,8 +667,9 @@ bool WorldStreamWriter::Append(const WorldDrawRun& run,float us,float v0,float v
                 if(run.BatchCount()==1){
                     // The GPU validates every member of the resulting range
                     // against this exact mesh. There is no sub-mesh boundary.
-                    std::copy(batch.indices->begin(),batch.indices->end(),indices+index);
-                    index+=batch.indices->size();
+                    const auto& sequence=run.source_strip?batch.retained->source_strip:*batch.indices;
+                    std::copy(sequence.begin(),sequence.end(),indices+index);
+                    index+=sequence.size();
                 }else{
                     for(auto local:*batch.indices){
                         if(local>=count){errno=EINVAL;return false;}
@@ -560,7 +684,7 @@ bool WorldStreamWriter::Append(const WorldDrawRun& run,float us,float v0,float v
         // The GPU binds this draw's own vertex base. Its indices stay local
         // even when the combined stream has more than 65536 vertices.
         ranges[range_count++]={unsigned(vertex_first),unsigned(run.count),
-            unsigned(index_first),unsigned(needed_indices),unsigned(vertex_first)};
+            unsigned(index_first),unsigned(needed_indices),unsigned(vertex_first),unsigned(run.source_strip)};
         index_count=index;
     }
     std::fill(vertices+vertex_count,vertices+vertex_first,SourceRenderVertex{});
@@ -584,11 +708,11 @@ bool AppendWorldStreamRun(const WorldDrawRun& run,float us,float v0,float v1,std
     ranges.resize(r);
     return false;
 }
-std::size_t MoscowStaticWorldBudget(std::size_t resident_bytes,std::size_t linear_free,std::size_t arena_free){
+std::size_t CityStaticWorldBudget(std::size_t resident_bytes,std::size_t linear_free,std::size_t arena_free,bool keep_turn_buffers){
     // Residents hold both the GPU upload and the original immutable mesh.
     // Leave room in both pools for textures, animation and changing geometry.
     constexpr std::size_t mib=1024*1024;
-    constexpr std::size_t maximum=8*mib;
+    const std::size_t maximum=(keep_turn_buffers?10:8)*mib;
     const auto headroom=std::min(std::int64_t(linear_free)-14*1024*1024,
                                  std::int64_t(arena_free)-8*1024*1024);
     const auto target=std::int64_t(std::min(resident_bytes,maximum))+headroom;
@@ -625,7 +749,7 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
     if(!source_application_os_is_new_3ds())static_budget=1024*1024;
     else if((view.local_arrays||view.city_stereo_fast)&&view.city_prop_radius>0&&view.mesh_retention){
         const auto arena_free=Mem::Manager::sHandle().BottomUpHeap()->ParentRegion()->MemAvailable();
-        static_budget=MoscowStaticWorldBudget(stats_.bytes,source_graphics_linear_free(),std::max(0,arena_free));
+        static_budget=CityStaticWorldBudget(stats_.bytes,source_graphics_linear_free(),std::max(0,arena_free),view.keep_turn_buffers);
     }
 #endif
     stats_.budget=static_budget;
@@ -633,7 +757,19 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
     stats_.prefix_hits=stats_.hits=stats_.uploads=stats_.evictions=stats_.streamed=stats_.indexed_meshes=stats_.static_indexed_runs=stats_.stream_indices=0;
     {
         NativeHeapScope storage;
-        build_world_draw_runs(batches,true,runs_);
+        build_world_draw_runs(batches,true,view.city_stereo_fast&&view.local_arrays,runs_);
+    }
+    stats_.strip_runs=stats_.strip_saved_indices=0;
+    // Preserve all material batching. Only substitute a strip after grouping,
+    // when one retained mesh already constitutes a complete indexed draw.
+    if(view.use_source_strips)for(auto& run:runs_){
+        if(run.retained_count!=1 || !run.indexed)continue;
+        const auto size=run.first->retained->source_strip.size();
+        if(!size)continue;
+        ++stats_.strip_runs;
+        stats_.strip_saved_indices+=run.element_count-size;
+        run.element_count=size;
+        run.source_strip=true;
     }
     const auto& runs=runs_;
     auto& choices=choices_;
@@ -654,7 +790,7 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
     }
     for(std::size_t i=0;i<runs.size();++i){
         const auto& run=runs[i];
-        if(!run.count||!run.element_count||run.element_count%3){errno=EINVAL;return false;}
+        if(!run.count||!run.element_count||(!run.source_strip&&run.element_count%3)){errno=EINVAL;return false;}
         if(!run.retained_count)continue;
         auto& choice=choices[i];
         const auto& batch=*run.first;
@@ -669,7 +805,7 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
         choice.key=batch.retained->serial;
         const bool sampled=!batch.texture||batch.texture->GPUResident();
         auto accepts=[&](const Resident& entry,bool allow_prefix){
-            return entry.u_scale==choice.u&&entry.v0==choice.v0&&entry.v1==choice.v1&&
+            return entry.source_strip==run.source_strip && entry.u_scale==choice.u&&entry.v0==choice.v0&&entry.v1==choice.v1&&
                    MatchesStaticRun(entry.meshes,entry.index_capacity!=0,run,allow_prefix)&&
                    (!shrinking||entry.last_seen==frame_||
                     source_graphics_stream_bytes(entry.capacity,entry.index_capacity)<=static_budget-pinned);
@@ -721,7 +857,10 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
         if(next_owner_check_==resident_.end())next_owner_check_=resident_.begin();
         auto at=next_owner_check_++;
         const auto& entry=at->second;
-        if(entry.last_seen!=frame_&&(frame_-entry.last_seen>120||
+        // In Manhattan a turn back to a busy street may be more than 120
+        // frames away. Keep a still-owned buffer until space is needed.
+        const bool aged_out=!view.keep_turn_buffers && frame_-entry.last_seen>120;
+        if(entry.last_seen!=frame_&&(aged_out||
            std::any_of(entry.meshes.begin(),entry.meshes.end(),[](const auto& mesh){return mesh->owner.expired();}))){
             wanted-=source_graphics_stream_bytes(entry.capacity,entry.index_capacity);
             evict(at);
@@ -825,6 +964,7 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
                 if(source_graphics_stream_write(&gpu,run.count,run.IndexCount(),run.indexed,write,&upload))return false;
                 NativeHeapScope storage;
                 Resident item;
+                item.source_strip=run.source_strip;
                 item.gpu=gpu;item.capacity=run.count;item.index_capacity=run.IndexCount();
                 item.u_scale=u;item.v0=v0;item.v1=v1;
                 item.meshes.reserve(run.retained_count);
@@ -832,6 +972,17 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
                 at=resident_.emplace(choice.key,std::move(item));
                 stats_.bytes+=source_graphics_stream_bytes(run.count,run.IndexCount());
                 ++stats_.uploads;
+                if(view.upload_trace){
+                    // Compare ordered immutable mesh IDs and layout, not GPU addresses.
+                    uint64 hash=14695981039346656037ull;
+                    auto mix=[&](uint64 id){hash=(hash^id)*1099511628211ull;};
+                    mix(run.count);mix(run.IndexCount());mix(run.source_strip);mix(run.retained_count);
+                    for(const float scale:{u,v0,v1}){
+                        uint32 bits;std::memcpy(&bits,&scale,sizeof(bits));mix(bits);
+                    }
+                    for(const auto& part:at->second.meshes)mix(part->serial);
+                    view.upload_trace->push_back(hash);
+                }
             }else{
                 packet.index_range=run.indexed?1:0;
                 packet.count=run.element_count;
