@@ -13,7 +13,7 @@ namespace SourcePort {
 class WorldOcclusion;
 class WorldMeshRetention;
 class WorldTextureLookup;
-struct WorldDetailStats {unsigned worker_items=0;unsigned shared_positions=0,ped_visible=0,ped_far=0,ped_samples=0,ped_replays=0,distant_prop_sectors=0,texture_hits=0,texture_misses=0,local_parts=0,local_triangles=0,local_array_parts=0,meshes=0,triangles=0,lod_meshes=0,lod_triangles_saved=0,partition_skipped=0,material_meshes=0,material_groups=0,range_meshes=0,range_triangles=0,backface_meshes=0,backface_triangles=0,occluded_sectors=0,skin_draws=0,retained_hits=0,retained_builds=0;uint64 pose_ticks=0,gather_ticks=0,sort_ticks=0,coalesce_ticks=0,group_ticks=0;};
+struct WorldDetailStats {unsigned worker_items=0;unsigned shared_positions=0,ped_visible=0,ped_far=0,ped_samples=0,ped_replays=0,distant_prop_sectors=0,texture_hits=0,texture_misses=0,local_parts=0,local_triangles=0,local_array_parts=0,meshes=0,triangles=0,lod_meshes=0,lod_triangles_saved=0,flat_meshes=0,partition_skipped=0,material_meshes=0,material_groups=0,range_meshes=0,range_triangles=0,backface_meshes=0,backface_triangles=0,occluded_sectors=0,skin_draws=0,retained_hits=0,retained_builds=0;uint64 pose_ticks=0,gather_ticks=0,sort_ticks=0,coalesce_ticks=0,group_ticks=0;};
 struct AmbientEffectCounts {
     unsigned fountain_visible=0,fountain_elements=0,weather_elements=0,legacy_elements=0,other_particle_elements=0;
 };
@@ -41,8 +41,10 @@ struct WorldView {
     bool local_arrays=false; // independent submission path for Moscow
     bool profile_pose=false;
     bool gpu_skin=false;
-    bool test_player_skin=false;
+    bool test_player_skin=false, old_player_lod=false;
     float static_detail_pixels=0,static_prop_radius=0,city_prop_radius=0;
+    float static_world_radius=0;
+    bool preserve_arena_landmarks=false;
     bool small_props_only=false,reclaim_cold_topology=false;
     float static_lod_pixels=0,static_lod_depth_per_unit=0,static_lod_min_distance=2000.f;
     float static_detail_horizontal=0,static_detail_vertical=0;
@@ -64,6 +66,7 @@ struct WorldDrawState {
     float draw_order=0,distance=0,z_bias=0;unsigned pass=0;std::size_t group=0;
 };
 struct StaticWorldMesh:WorldDrawState {
+    uint32 distant_color=0;
     std::vector<SourceRenderVertex> vertices;
     std::shared_ptr<const std::vector<uint16>> indices;
     std::vector<uint16> source_strip;
@@ -218,9 +221,10 @@ public:
     // replace the surface's own sampler streams (including unused sentinels).
     void Gather(const SourcePort::WorldView&,uint32,std::vector<SourcePort::WorldBatch>&,bool snapshot=false,bool raw_colors=false,bool projection_receiver=false,unsigned frustum_mask=0x3f)const;
     void SetScene(CScene* scene){scene_=scene;}
-    void SetStaticWorldMaterials(std::shared_ptr<const SourcePort::StaticWorldMaterials> materials){static_materials_=std::move(materials);city_prop_extent_=-1;}
+    void SetStaticWorldMaterials(std::shared_ptr<const SourcePort::StaticWorldMaterials> materials);
     void EnableStaticWorldPartition();
     bool InStaticWorldPartition()const{return partitioned_;}
+    bool CanLimitWorldRange() const;
     void MarkPartitionVisible(uint64 stamp,unsigned planes,unsigned occluders){partition_stamp_=stamp;partition_planes_=planes;partition_occluders_=occluders;}
     bool VisibleInPartition(uint64 stamp)const{return !partitioned_||partition_stamp_==stamp;}
     unsigned PartitionOccluders(uint64 stamp)const{return partitioned_&&partition_stamp_==stamp?partition_occluders_:~0u;}

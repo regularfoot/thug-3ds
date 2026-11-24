@@ -1,4 +1,5 @@
 #include <source_port/static_world_lod.h>
+#include <source_port/application_os.h>
 #include <sys/file/filesys.h>
 #include <algorithm>
 #include <string>
@@ -90,13 +91,70 @@ bool ReadSceneLods(const ResourceBytes& sidecar, const ResourceBytes& scene, Sce
     return read_scene_lods(sidecar, {scene.size(), SceneLodChecksum(scene)}, asset);
 }
 
+// FX01 binds names from the level QB to its matching retail scene.
+static void load_scenery_effects(const std::string& stem, SceneSignature scene, SceneAsset& asset) {
+    const std::string path = "lods/old/" + stem + ".3fx";
+    void* file = File::Open(path.c_str(), "rb");
+    if (!file) return;
+    const long length = File::GetFileSize(file);
+    ResourceBytes data;
+    if (length >= 16 && length <= 16 + 5 * 4096) data.resize(length);
+    const bool read = !data.empty() && File::Read(data.data(), 1, data.size(), file) == data.size();
+    File::Close(file);
+    if (!read || std::memcmp(data.data(), "FX01", 4)) return;
+    ResourceReader reader(data.data() + 4, data.size() - 4, nullptr);
+    if (reader.U32() != scene.size || reader.U32() != scene.checksum) return;
+    const uint32 count = reader.U32();
+    if (count > 4096 || reader.Remaining() != count * 5) return;
+    std::vector<std::pair<uint32, unsigned>> names;
+    names.reserve(count);
+    for (uint32 i = 0; i < count; ++i) {
+        const auto key = reader.U32();
+        const unsigned kind = reader.U8();
+        if ((kind < 1 || kind > 3) || (i && key <= names.back().first)) return;
+        names.emplace_back(key, kind);
+    }
+    unsigned shadows = 0, reflections = 0, seats = 0;
+    for (auto& sector : asset.sectors) {
+        const auto match = std::lower_bound(names.begin(), names.end(), sector.checksum,
+            [](const auto& entry, uint32 key) { return entry.first < key; });
+        if (match == names.end() || match->first != sector.checksum || sector.meshes.empty()) continue;
+        if (match->second == 3) {
+            if (!strcasecmp(stem.c_str(), "sj")) {
+                sector.scenery_effect = true;
+                ++seats;
+            }
+            continue;
+        }
+        if (match->second == 1) {
+            // Some sectors named "shadow" contain a solid ramp or floor.
+            // Only remove shadow decals when every mesh uses blending.
+            const bool all_decals = std::all_of(sector.meshes.begin(), sector.meshes.end(), [&](const auto& mesh) {
+                const auto material = std::find_if(asset.materials.begin(), asset.materials.end(),
+                    [&](const auto& item) { return item.checksum == mesh.material; });
+                if (material == asset.materials.end() || material->passes.empty()) return false;
+                const auto blend = material->passes.front().alpha & 0xffffff;
+                return blend >= 1 && blend <= 6;
+            });
+            if (!all_decals) continue;
+            ++shadows;
+        } else {
+            ++reflections;
+        }
+        sector.scenery_effect = true;
+    }
+    Log("OLD_SCENERY scene=%s shadows=%u reflections=%u seat_banks=%u", stem.c_str(), shadows, reflections, seats);
+}
+
 void LoadSceneLods(const char* scene_name, SceneSignature scene, SceneAsset& asset) {
     const std::string filename(scene_name);
     const auto separator = filename.find_last_of("/\\");
     const auto base = separator == std::string::npos ? filename : filename.substr(separator + 1);
     if (base.size() <= 8 || strcasecmp(base.c_str() + base.size() - 8, ".scn.xbx")) return;
+    if (source_application_os_is_old_3ds()) load_scenery_effects(base.substr(0, base.size() - 8), scene, asset);
     const auto path = "lods/" + base.substr(0, base.size() - 8) + ".3dl";
-    auto* file = File::Open(path.c_str(), "rb");
+    auto* file = source_application_os_is_old_3ds()?File::Open(("lods/old/"+base.substr(0,base.size()-8)+".3dl").c_str(),"rb"):nullptr;
+    if(!file)file=File::Open(path.c_str(),"rb");
     if (!file) return;
     const auto size = File::GetFileSize(file);
     ResourceBytes sidecar;

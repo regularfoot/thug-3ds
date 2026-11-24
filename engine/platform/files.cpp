@@ -43,16 +43,20 @@ DiskFile files[64]{};
 // Idle streams only. Concurrent logical members still own separate FILEs.
 struct IdleArchive { FILE* stream = nullptr; char path[128]{}; };
 std::array<IdleArchive, 4> idle_archives{};
-struct DiskPreEntry {
+struct DiskPreWireEntry {
     char name[128];
     std::uint32_t offset;
     std::uint32_t size;
 };
-static_assert(sizeof(DiskPreEntry) == 136);
+static_assert(sizeof(DiskPreWireEntry) == 136);
+struct DiskPreEntry {
+    std::uint32_t name_offset, offset, size;
+};
 struct DiskPre {
     std::string name;
     std::string path;
     std::vector<DiskPreEntry> entries;
+    std::vector<char> member_names;
 };
 std::vector<DiskPre> disk_pres;
 std::uintptr_t next_id = 1;
@@ -173,8 +177,10 @@ const DiskPreEntry* disk_pre_member(const std::string& name, const char*& archiv
         // Texture payloads remain in RAM as they did with loose files.
         if(for_streaming&&pre.name=="npcparts.pre")continue;
         const auto at = std::lower_bound(pre.entries.begin(), pre.entries.end(), name,
-            [](const auto& entry, const auto& key) { return std::string_view(entry.name) < key; });
-        if (at != pre.entries.end() && name == at->name) {
+            [&](const auto& entry, const auto& key) {
+                return std::string_view(pre.member_names.data() + entry.name_offset) < key;
+            });
+        if (at != pre.entries.end() && name == pre.member_names.data() + at->name_offset) {
             archive_path = pre.path.c_str();
             return &*at;
         }
@@ -249,22 +255,30 @@ bool MountDiskPre(const char* archive) {
         std::fread(header.data(), sizeof(header), 1, file.get()) == 1 &&
         header[0] == 0x314d5044 && header[1] > 0 && header[1] <= 2048,
         ("Invalid low-memory PRE index: %s", path.c_str()));
-    std::vector<DiskPreEntry> entries(header[1]);
-    const auto data_start = sizeof(header) + entries.size() * sizeof(DiskPreEntry);
-    Dbg_MsgAssert(std::fread(entries.data(), sizeof(DiskPreEntry), entries.size(), file.get()) == entries.size(),
-                  ("Truncated low-memory PRE index: %s", path.c_str()));
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        const auto& entry = entries[i];
-        Dbg_MsgAssert(std::memchr(entry.name, 0, sizeof(entry.name)) && entry.name[0] &&
+    const auto count = header[1];
+    const auto data_start = sizeof(header) + count * sizeof(DiskPreWireEntry);
+    Dbg_MsgAssert(data_start <= std::uint64_t(info.st_size), ("Truncated low-memory PRE index: %s", path.c_str()));
+    DiskPre pre{std::move(name), path, {}, {}};
+    pre.entries.reserve(count);
+    pre.member_names.reserve(32 * count);
+    for (unsigned i = 0; i < count; ++i) {
+        DiskPreWireEntry entry;
+        Dbg_MsgAssert(std::fread(&entry, sizeof(entry), 1, file.get()) == 1,
+                      ("Truncated low-memory PRE index: %s", path.c_str()));
+        const auto length = strnlen(entry.name, sizeof(entry.name));
+        Dbg_MsgAssert(length && length < sizeof(entry.name) &&
             entry.offset >= data_start && std::uint64_t(entry.offset) + entry.size <= std::uint64_t(info.st_size) &&
-            (i == 0 || std::strcmp(entries[i - 1].name, entry.name) < 0),
+            (i == 0 || std::strcmp(pre.member_names.data() + pre.entries.back().name_offset, entry.name) < 0),
             ("Invalid low-memory PRE member: %s entry %u", path.c_str(), unsigned(i)));
+        pre.entries.push_back({std::uint32_t(pre.member_names.size()), entry.offset, entry.size});
+        pre.member_names.insert(pre.member_names.end(), entry.name, entry.name + length + 1);
     }
-    Log("DISK_PRE name=%s entries=%zu index_bytes=%zu", archive, entries.size(), data_start);
+    Log("DISK_PRE name=%s entries=%zu index_bytes=%zu resident_index_bytes=%zu", archive, pre.entries.size(),
+        data_start, pre.entries.capacity() * sizeof(DiskPreEntry) + pre.member_names.capacity());
 #ifdef __3DS__
     BootPhase(archive);
 #endif
-    disk_pres.push_back({std::move(name), path, std::move(entries)});
+    disk_pres.push_back(std::move(pre));
     return true;
 }
 
@@ -342,8 +356,11 @@ void* AllocatePipPreBuffer(const char* archive, std::size_t size, bool expanded)
 
 char* LoadPreparedPipPre(const char* archive) {
 #ifdef __3DS__
-    if (source_application_os_is_new_3ds() || strcasecmp(archive, "unloadableanims.pre")) return nullptr;
-    constexpr char path[] = "pre/lowmem/unloadableanims.apre";
+    if (source_application_os_is_new_3ds()) return nullptr;
+    const char* path;
+    if (!strcasecmp(archive, "unloadableanims.pre")) path = "pre/lowmem/unloadableanims.apre";
+    else if (!strcasecmp(archive, "netanims.pre")) path = "pre/lowmem/netanims.apre";
+    else return nullptr;
     std::unique_ptr<FILE, decltype(&std::fclose)> file(open_resource(path, "rb"), std::fclose);
     if (!file) return nullptr;
     struct stat info{};

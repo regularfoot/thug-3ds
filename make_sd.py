@@ -11,6 +11,7 @@ import zlib
 import sys
 import tempfile
 from tools.pack_npc_resources import pack
+from tools.bake_scenery_effects import bake as bake_scenery_effects
 
 ROOT = Path(__file__).resolve().parent
 BUILD_ID_HEADER = ROOT / 'engine/platform/source_port/build_id.h'
@@ -106,6 +107,8 @@ def main():
         for flag in ['normal','opaque']:
             if profile['lods'][flag]:
                 tool('source_bake_world_lods',data,data/'lods',*(['--opaque-surfaces'] if flag=='opaque' else []),*profile['lods'][flag])
+        tool('source_bake_world_lods',data,data/'lods/old','--old-surfaces')
+        bake_scenery_effects(data)
         cache = stage/'retail-cache.3tc'
         tool('source_bake_texture_cache',data,cache)
         compact_texture_cache(cache, data/'textures.3tc')

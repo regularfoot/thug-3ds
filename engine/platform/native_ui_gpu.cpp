@@ -2,6 +2,8 @@
 #include <source_port/graphics.h>
 #include <source_port/thread_os.h>
 #include <algorithm>
+#include <cstring>
+#include <source_port/application_os.h>
 #include <limits>
 namespace SourcePort {
 namespace {
@@ -33,7 +35,7 @@ void CoalesceUIDrawPackets(std::vector<SourceDrawPacket>& packets){
 }
 NativeUIBatch::~NativeUIBatch(){Release();}
 void NativeUIBatch::Release(){
-    Dbg_Assert(source_thread_is_controller());if(mesh_){Dbg_Assert(source_graphics_mesh_delete(mesh_)==0);mesh_=nullptr;}decltype(vertices_)().swap(vertices_);
+    Dbg_Assert(source_thread_is_controller());if(mesh_){Dbg_Assert(source_graphics_mesh_delete(mesh_)==0);mesh_=nullptr;}decltype(vertices_)().swap(vertices_);uploaded_vertices_=0;
 }
 bool NativeUIBatch::Prepare(const std::vector<UIQuad>& quads,std::vector<SourceDrawPacket>& out){
     Dbg_Assert(source_thread_is_controller());if(!GraphicsReady()){errno=ENODEV;return false;}
@@ -58,9 +60,26 @@ bool NativeUIBatch::Prepare(const std::vector<UIQuad>& quads,std::vector<SourceD
         // Every mutation is fenced inside the GPU bridge. Never update a
         // live UI buffer between the two eyes of one rendered frame.
         auto* fresh=source_graphics_mesh_create(replacement.data(),replacement.size());if(!fresh)return false;
-        if(mesh_)Dbg_Assert(source_graphics_mesh_delete(mesh_)==0);mesh_=fresh;vertices_.swap(replacement);
+        if(mesh_)Dbg_Assert(source_graphics_mesh_delete(mesh_)==0);mesh_=fresh;vertices_.swap(replacement);uploaded_vertices_=vertices_.size();
     }else{
-        std::copy(active.begin(),active.end(),vertices_.begin());if(source_graphics_mesh_update(mesh_,vertices_.data(),vertices_.size()))return false;
+        const bool old_console=source_application_os_is_old_3ds();
+        const auto live=active.size();
+        const bool identical=old_console && live<=uploaded_vertices_ &&
+            std::memcmp(active.data(),vertices_.data(),live*sizeof(SourceRenderVertex))==0;
+        if(!identical){
+            if(old_console){
+                if(source_graphics_mesh_update(mesh_,active.data(),live)){
+                    uploaded_vertices_=0;
+                    return false;
+                }
+                std::copy(active.begin(),active.end(),vertices_.begin());
+                uploaded_vertices_=live;
+            }else{
+                std::copy(active.begin(),active.end(),vertices_.begin());
+                if(source_graphics_mesh_update(mesh_,vertices_.data(),vertices_.size()))return false;
+                uploaded_vertices_=vertices_.size();
+            }
+        }
     }
     for(auto& p:packets)p.mesh=mesh_;out.swap(packets);return true;
 }

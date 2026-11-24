@@ -269,12 +269,17 @@ typedef struct SourceGpuInputDraw {
     C3D_Tex texture;
     unsigned packet, first, elements, vertex_first, vertex_count, index_first, vertex_base;
     uint8_t eye, texture_owner, clip_owner, orthographic, depth_write, alpha_cutoff, cull, strip;
+    bool sampler_vram;
     C3D_Mtx clip;
 } SourceGpuInputDraw;
 enum { FILL_IRQ, DRAW_IRQ, TRANSFER_IRQ, VBLANK_IRQ, IRQ_COUNT };
 static struct {
     int open,acquired,program_ready,fence_error;
     C3D_RenderTarget* target[2];
+    C3D_RenderTarget* low_target;
+    SourceGpuTexture low_color;
+    SourceGpuMesh* low_quad;
+    bool right_eye_alloc_failed, low_attempted;
     DVLB_s* dvlb;
     shaderProgram_s program;
     int clip_matrix;
@@ -455,6 +460,7 @@ static int capture_inputs(FILE* file,void* unused) {
     // All words are little-endian u32, followed by 16 clip-matrix floats.
     unsigned version=1;
     for(unsigned i=0;i<gpu.input_count;++i)if(gpu.input_draws[i].strip)version=2;
+    if(gpu.fence_error && source_application_os_is_old_3ds())version=3;
     const uint32_t header[4]={0x50474854,version,gpu.submitted.serial,gpu.input_count};
     if(capture_bytes(file,header,sizeof(header)))return -1;
     for(unsigned i=0;i<gpu.input_count;++i){
@@ -477,12 +483,15 @@ static int capture_inputs(FILE* file,void* unused) {
             unsigned owner=gpu.input_draws[previous].texture_owner;
             if(gpu.input_draws[owner].texture.data==texture->data){m[16]=0;break;}
         }
+        // A failed PICA fence leaves VRAM unavailable for a reliable FS write.
+        const bool omit_vram=version==3 && gpu.input_draws[draw->texture_owner].sampler_vram;
+        if(omit_vram)m[16]=UINT32_MAX;
         if(capture_bytes(file,m,sizeof(m)) ||
            capture_bytes(file,clip,sizeof(*clip)) ||
            capture_bytes(file,mesh->vertices+m[5],m[6]*sizeof(SourceRenderVertex)) ||
            capture_bytes(file,draw->indices,m[8]*sizeof(uint16_t)))return -1;
         // A repeated texture carries its descriptor again but no duplicate payload.
-        if(capture_bytes(file,texture->data,m[16]))return -1;
+        if(!omit_vram && capture_bytes(file,texture->data,m[16]))return -1;
         if(mesh->skin &&
            (capture_bytes(file,mesh->skin->influences+m[5],m[6]*sizeof(SourceSkinInfluence)) ||
             capture_bytes(file,mesh->skin->rows,m[17]*3*4*sizeof(float))))return -1;
@@ -644,6 +653,13 @@ static int complete_present(unsigned eyes){
         if(transfer(__func__,gpu.target[eye],output,flags))return -1;
     }
     gfxScreenSwapBuffers(GFX_TOP,eyes==2);
+    // The preceding mono draw and display transfer have both finished. A
+    // mono load screen with the slider still up must retain the stereo target.
+    if (eyes == 1 && gpu.target[1] && source_application_os_is_old_3ds() && osGet3DSliderState() <= 0.f) {
+        C3D_RenderTargetDelete(gpu.target[1]);
+        gpu.target[1] = NULL;
+        gpu.history_valid[1] = 0;
+    }
     if(sample->tag){
         sample->swap_tick=source_clock_now();
         gpu.presented[sample->tag%4]=*sample;
@@ -730,6 +746,8 @@ static int vertices_valid(const SourceRenderVertex* data,size_t count){
 static void rollback(void) {
     finish();
     if(gpu.array_indices && !gpu.fence_error)linearFree(gpu.array_indices);
+    if(gpu.low_target)C3D_RenderTargetDelete(gpu.low_target);
+    if(gpu.low_color.texture.data)C3D_TexDelete(&gpu.low_color.texture);
     if (gpu.white_ready) C3D_TexDelete(&gpu.white);
     if (gpu.skin_ready) shaderProgramFree(&gpu.skin_program);
     if (gpu.skin_dvlb) DVLB_Free(gpu.skin_dvlb);
@@ -770,6 +788,18 @@ static void draw_touch_controls(void) {
     GSPGPU_FlushDataCache(fb, SOURCE_TOUCH_WIDTH * SOURCE_TOUCH_HEIGHT * sizeof(*fb));
     gfxScreenSwapBuffers(GFX_BOTTOM, false);
 }
+static C3D_RenderTarget* create_eye_target(void) {
+    return C3D_RenderTargetCreate(240,400,GPU_RB_RGBA8,GPU_RB_DEPTH24_STENCIL8);
+}
+static bool ensure_right_eye(void) {
+    if (!gpu.target[1] && !gpu.right_eye_alloc_failed) {
+        gpu.target[1] = create_eye_target();
+        gpu.right_eye_alloc_failed = gpu.target[1] == NULL;
+        if (gpu.right_eye_alloc_failed)
+            fprintf(stderr,"Right eye allocation failed, VRAM free=%lu\n",(unsigned long)vramSpaceFree());
+    }
+    return gpu.target[1] != NULL;
+}
 int source_graphics_open(void) {
     if (!controller()) return -1;
     if (gpu.open) { errno=EALREADY; return -1; }
@@ -779,7 +809,8 @@ int source_graphics_open(void) {
     gpu.command_buffer_bytes = source_application_os_is_old_3ds() ? OLD_COMMAND_BUFFER_BYTES : COMMAND_BUFFER_BYTES;
     if (!C3D_Init(gpu.command_buffer_bytes)) { gfxExit();errno=ENOMEM;return -1; }
     gpu.open=1;
-    if(source_application_os_is_new_3ds()){
+    {
+        // Both handhelds use one draw mode even when an asset has no index buffer.
         const size_t bytes=SOURCE_ARRAY_INDEX_WORDS*sizeof(uint16_t);
         gpu.array_indices=linearMemAlign(bytes,128);
         if(!gpu.array_indices){rollback();errno=ENOMEM;return -1;}
@@ -795,9 +826,9 @@ int source_graphics_open(void) {
     // FIFO counts any GPU interrupt as progress. Each submission below waits
     // for its own event type before starting the next hardware operation.
     GX_BindQueue(NULL);
-    for (unsigned i=0;i<2;++i) {
-        gpu.target[i]=C3D_RenderTargetCreate(240,400,GPU_RB_RGBA8,GPU_RB_DEPTH24_STENCIL8);
-        if (!gpu.target[i]) { rollback();errno=ENOMEM;return -1; }
+    gpu.target[0] = create_eye_target();
+    if (!gpu.target[0] || (source_application_os_is_new_3ds() && !ensure_right_eye())) {
+        rollback(); errno=ENOMEM; return -1;
     }
     gpu.dvlb=DVLB_ParseFile((u32*)world_shbin,(u32)(world_shbin_end-world_shbin));
     if (!gpu.dvlb || gpu.dvlb->numDVLE!=1) { rollback();errno=EILSEQ;return -1; }
@@ -831,6 +862,10 @@ int source_graphics_set_blur(unsigned amount){
 }
 int source_graphics_close(void) {
     if (!controller() || !gpu.open) { errno=ENODEV;return -1; }
+    if(gpu.low_quad){
+        if(source_graphics_mesh_delete(gpu.low_quad))return -1;
+        gpu.low_quad=NULL;
+    }
     release_blur();if (gpu.meshes || gpu.textures) { errno=EBUSY;return -1; }
     if (acquire(__func__)) return -1; // complete prior submissions before freeing GPU objects
     gspSetEventCallback(GSPGPU_EVENT_VBlank0,NULL,NULL,false);
@@ -1274,7 +1309,15 @@ static int blur_frame(float stereo){
     free(current);free(tiled);return present(eyes);
 fail:finish();free(current);free(tiled);return -1;
 }
-float source_graphics_slider(void){if(!controller()||!gpu.open){errno=ENODEV;return NAN;}return source_stereo_slider(osGet3DSliderState());}
+float source_graphics_slider(void) {
+    if (!controller() || !gpu.open) { errno=ENODEV; return NAN; }
+    const float slider = source_stereo_slider(osGet3DSliderState());
+    if (slider == 0.f) gpu.right_eye_alloc_failed = false;
+    // Camera setup and submission must agree even when VRAM is fragmented.
+    // With no right target, stay in mono until the next slider activation.
+    if (slider > 0.f && !ensure_right_eye()) return 0.f;
+    return slider;
+}
 int source_graphics_submit(const SourceDrawPacket* packets,size_t count,uint32_t clear,float stereo){return source_graphics_submit_frame(packets,count,clear,stereo,1);}
 static int validate_packet_range(const SourceDrawPacket* packets,size_t count,float stereo) {
     if ((!packets&&count)||count>65536||!isfinite(stereo)||stereo<0||stereo>1) { errno=EINVAL;return -1; }
@@ -1309,6 +1352,7 @@ static void setup_vertex_input(bool skin,bool combined,bool first) {
     }
 }
 static int start_draw(float stereo,uint32_t clear,int clear_color) {
+    if (stereo > 0.f && !ensure_right_eye()) { errno=ENOMEM; return -1; }
     if(acquire(__func__))return -1;
     gpu.eyes=stereo>0?2:1;
     gpu.draw_segment_us=0;
@@ -1418,9 +1462,9 @@ void __real_C3D_UpdateUniforms(GPU_SHADER_TYPE type);
 void __wrap_C3D_UpdateUniforms(GPU_SHADER_TYPE type){
     if(!(clean_uniform_stages & (1u<<type)))__real_C3D_UpdateUniforms(type);
 }
-static int encode_packet_range(const SourceDrawPacket* packets,size_t count,float stereo) {
-    // Replay only immutable draw data. Neither QB nor physics runs per eye.
-    for (unsigned eye=0;eye<(stereo>0?2u:1u);++eye) {
+static int encode_eye(const SourceDrawPacket* packets,size_t first,size_t end,size_t count,float stereo,
+                      unsigned eye,C3D_RenderTarget* target,bool reduced) {
+    {
         const SourceDrawPacket* fog_state=NULL;
         const SourceDrawPacket* raster_state=NULL;
         int fog_mode=-1;
@@ -1432,8 +1476,8 @@ static int encode_packet_range(const SourceDrawPacket* packets,size_t count,floa
         bool sequence_ready=false;
         u32 vertex_window=0;
         C3D_Mtx projection,view,clip;
-        if (!C3D_FrameDrawOn(gpu.target[eye])) { finish();errno=EIO;return -1; }
-        for (size_t i=0,drawn=0;i<count;) {
+        if (!C3D_FrameDrawOn(target)) { finish();errno=EIO;return -1; }
+        for (size_t i=first,drawn=0;i<end;) {
             const SourceDrawPacket* p=&packets[i];
             const unsigned slice=source_graphics_draw_slice(p->count-(unsigned)drawn);
             // End the previous eye or 3D pass before rebinding a new eye or
@@ -1444,7 +1488,7 @@ static int encode_packet_range(const SourceDrawPacket* packets,size_t count,floa
                 (gpu.segment_eyes && !(gpu.segment_eyes&(1u<<eye))) ||
                 (p->orthographic && !gpu.segment_overlay);
             unsigned recycles=gpu.command_recycles;
-            if(command_room(gpu.target[eye],slice,boundary)){finish();return -1;}
+            if(command_room(target,slice,boundary)){finish();return -1;}
             if(recycles!=gpu.command_recycles){sequence_ready=false;fog_state=raster_state=NULL;fog_mode=skin_mode=-1;bound_vertices=local_vertices=NULL;}
             unsigned changes;
             if(!raster_state)changes=SOURCE_GFX_FULL_TRANSITION;
@@ -1502,7 +1546,15 @@ static int encode_packet_range(const SourceDrawPacket* packets,size_t count,floa
                 C3D_FVUnifSet(GPU_VERTEX_SHADER,gpu.skin_uv,p->skin_u_scale,p->skin_v_scale,p->skin_v_offset,0);
             }
             // Top framebuffer is rotated 90 degrees; scissor/viewport follow it.
-            if(changes&SOURCE_GFX_VIEWPORT){C3D_SetViewport(p->y,400-p->x-p->width,p->height,p->width);
+            if((changes&SOURCE_GFX_VIEWPORT)&&reduced){
+                const unsigned width=SOURCE_OLD_WORLD_WIDTH,height=SOURCE_OLD_WORLD_HEIGHT;
+                const unsigned x=p->x*width/400,y=p->y*height/240;
+                const unsigned right=((p->x+p->width)*width+399)/400,bottom=((p->y+p->height)*height+239)/240;
+                C3D_SetViewport(y,width-right,bottom-y,right-x);
+                if(p->clip_enabled)C3D_SetScissor(GPU_SCISSOR_NORMAL,p->clip_y*height/240,
+                    width-((p->clip_x+p->clip_width)*width+399)/400,((p->clip_y+p->clip_height)*height+239)/240,width-p->clip_x*width/400);
+                else C3D_SetScissor(GPU_SCISSOR_DISABLE,0,0,height,width);
+            }else if(changes&SOURCE_GFX_VIEWPORT){C3D_SetViewport(p->y,400-p->x-p->width,p->height,p->width);
             if(p->clip_enabled)C3D_SetScissor(GPU_SCISSOR_NORMAL,p->clip_y,400-p->clip_x-p->clip_width,p->clip_y+p->clip_height,400-p->clip_x);
             else C3D_SetScissor(GPU_SCISSOR_DISABLE,0,0,240,400);}
             if(changes&SOURCE_GFX_DEPTH)C3D_DepthTest(!p->orthographic||p->ui_depth,GPU_GEQUAL,p->depth_write?GPU_WRITE_ALL:GPU_WRITE_COLOR);
@@ -1585,6 +1637,7 @@ static int encode_packet_range(const SourceDrawPacket* packets,size_t count,floa
             if(!gpu.input_count || (changes&SOURCE_GFX_SAMPLER)){
                 texture_owner=gpu.input_count;
                 input->texture=gpu.sampler;
+                input->sampler_vram=p->texture && p->texture->vram;
             }
             if(!gpu.input_count || projection_changed || view_changed || program_changed){
                 clip_owner=gpu.input_count;
@@ -1649,6 +1702,11 @@ static int encode_packet_range(const SourceDrawPacket* packets,size_t count,floa
     }
     return 0;
 }
+static int encode_packet_range(const SourceDrawPacket* packets,size_t count,float stereo) {
+    for(unsigned eye=0;eye<gpu.eyes;++eye)
+        if(encode_eye(packets,0,count,count,stereo,eye,gpu.target[eye],false))return -1;
+    return 0;
+}
 static int validate_packets(const SourceDrawPacket* packets,size_t count,float stereo){
     if(!measure_command_cpu)return validate_packet_range(packets,count,stereo);
     const uint64_t start=source_clock_now();
@@ -1672,6 +1730,58 @@ int source_graphics_submit_frame(const SourceDrawPacket* packets,size_t count,ui
 int source_graphics_submit_bounded(const SourceDrawPacket* packets,size_t count,uint32_t clear,float stereo) {
     gpu.bounded_list=true;
     const int result=source_graphics_submit_frame(packets,count,clear,stereo,1);
+    gpu.bounded_list=false;
+    return result;
+}
+int source_graphics_low_target_active(void){return gpu.low_target!=NULL;}
+// One RGB565 render texture serves both eyes in turn. HUD and presentation
+// retain the native target. Fence each change of owner before clearing or sampling.
+static bool ready_low_target(void){
+    if(gpu.low_quad)return true;
+    if(!C3D_TexInitVRAM(&gpu.low_color.texture,256,512,GPU_RGB565))return false;
+    gpu.low_color.vram=true;
+    gpu.low_target=C3D_RenderTargetCreateFromTex(&gpu.low_color.texture,GPU_TEXFACE_2D,0,GPU_RB_DEPTH24);
+    if(gpu.low_target){
+        const float u=SOURCE_OLD_WORLD_HEIGHT/256.f,v=SOURCE_OLD_WORLD_WIDTH/512.f;
+        const SourceRenderVertex quad[]={
+            {0,0,0,255,255,255,255,u,v},{0,448,0,255,255,255,255,0,v},{640,448,0,255,255,255,255,0,0},
+            {0,0,0,255,255,255,255,u,v},{640,448,0,255,255,255,255,0,0},{640,0,0,255,255,255,255,u,0}};
+        gpu.low_quad=source_graphics_mesh_create(quad,6);
+        if(gpu.low_quad)return true;
+        C3D_RenderTargetDelete(gpu.low_target);gpu.low_target=NULL;
+    }
+    C3D_TexDelete(&gpu.low_color.texture);gpu.low_color=(SourceGpuTexture){0};
+    return false;
+}
+static int join_low_pass(void){
+    finish();
+    if(acquire(__func__))return -1;
+    gpu.draw_segment_us+=gpu.gpu_previous_draw_us;
+    return 0;
+}
+int source_graphics_submit_low(const SourceDrawPacket* packets,size_t count,size_t world_count,uint32_t clear,float stereo,int bounded){
+    if(world_count>count||!world_count||gpu.early_open){errno=EINVAL;return -1;}
+    if(validate_packets(packets,count,stereo))return -1;
+    if(!gpu.low_quad && !gpu.low_attempted){
+        gpu.low_attempted=true;
+        ready_low_target();
+    }
+    if(!gpu.low_quad)return bounded?source_graphics_submit_bounded(packets,count,clear,stereo):source_graphics_submit(packets,count,clear,stereo);
+    if(start_draw(stereo,clear,0))return -1;
+    gpu.bounded_list=bounded!=0;
+    SourceDrawPacket quad={.mesh=gpu.low_quad,.texture=&gpu.low_color,.count=6,.width=400,.height=240,.orthographic=1,.nearest=1};
+    for(unsigned i=0;i<4;++i)quad.model_view[i*5]=1;
+    int result=-1;
+    for(unsigned eye=0;eye<gpu.eyes;++eye){
+        if(eye && join_low_pass())goto done;
+        const uint32_t rgb565=((clear>>16)&0xf800)|((clear>>13)&0x07e0)|((clear>>11)&0x001f);
+        if(clear_target(gpu.low_target,C3D_CLEAR_ALL,rgb565*0x10001u))goto done;
+        if(encode_eye(packets,0,world_count,count,stereo,eye,gpu.low_target,true)||join_low_pass())goto done;
+        if(encode_eye(&quad,0,1,1,stereo,eye,gpu.target[eye],false))goto done;
+        if(world_count<count && encode_eye(packets,world_count,count,count,stereo,eye,gpu.target[eye],false))goto done;
+    }
+    result=present(gpu.eyes);
+done:
     gpu.bounded_list=false;
     return result;
 }
@@ -1756,6 +1866,8 @@ int source_graphics_texture_update(SourceGpuTexture* t,const uint8_t* p,size_t n
 int source_graphics_submit(const SourceDrawPacket* p,size_t n,uint32_t c,float s) { (void)p;(void)n;(void)c;(void)s;errno=ENOTSUP;return -1; }
 int source_graphics_submit_bounded(const SourceDrawPacket* p,size_t n,uint32_t c,float s){(void)p;(void)n;(void)c;(void)s;errno=ENOTSUP;return -1;}
 int source_graphics_submit_frame(const SourceDrawPacket* p,size_t n,uint32_t c,float s,int clear) { (void)p;(void)n;(void)c;(void)s;(void)clear;errno=ENOTSUP;return -1; }
+int source_graphics_low_target_active(void){return 0;}
+int source_graphics_submit_low(const SourceDrawPacket* p,size_t n,size_t w,uint32_t c,float s,int bounded){(void)w;return bounded?source_graphics_submit_bounded(p,n,c,s):source_graphics_submit(p,n,c,s);}
 int source_graphics_submit_early(const SourceDrawPacket* p,size_t n,uint32_t c,float s,int bounded){(void)bounded;(void)p;(void)n;(void)c;(void)s;errno=ENOTSUP;return -1;}
 int source_graphics_wait_early(void){errno=ENOTSUP;return -1;}
 int source_graphics_submit_remaining(const SourceDrawPacket* p,size_t n,float s){(void)p;(void)n;(void)s;errno=ENOTSUP;return -1;}

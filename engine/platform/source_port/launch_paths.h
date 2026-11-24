@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+namespace Script { class CStruct; }
 namespace SourcePort {
 struct GameLaunchPaths {std::string root,data,saves,journal;};
 bool ResolveGameLaunchPaths(const char* executable,const char* fallback,GameLaunchPaths&);
@@ -8,6 +9,10 @@ const char* StartupSaveName();
 bool SkipOpeningMovies();
 bool PerformanceRouteEnabled();
 bool HideVancouverAmbient();
+bool OldFreeSkateAmbientDisabled();
+bool OmitSceneryScript(unsigned checksum);
+bool OmitAmbientNode(Script::CStruct* node);
+bool IsAmbientModelPath(const char* name);
 bool CompareVancouverAmbient();
 bool CompareCityOptions();
 bool MoscowTurnTrial();

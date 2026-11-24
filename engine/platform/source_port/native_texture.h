@@ -9,6 +9,7 @@ public:
     CNativeTexture();~CNativeTexture()override;
     bool Assign(SourcePort::TextureAsset asset);
     SourceGpuTexture* GPU();
+    uint32 DistantColor()const{return !dirty_&&!target_&&!asset_.image?compressed_entry_.distant_color:0;}
     bool GPUResident()const{return gpu_!=nullptr;}
     float UScale()const{return u_scale_;}float VScale()const{return v_scale_;}
     float GPUV(float source_v)const;
@@ -58,12 +59,12 @@ private:
 class CNativeTexDict final:public CTexDict {
 public:
     explicit CNativeTexDict(uint32 key):CTexDict(key,true){}
-    bool Load(std::shared_ptr<const SourcePort::ResourceBytes>);
+    bool Load(std::shared_ptr<const SourcePort::ResourceBytes>, const char* name=nullptr);
     bool LoadDisk(const char* name);
     void EnableOpaqueWorldMipmaps(const std::vector<SourcePort::MaterialAsset>&, const char* scene_name);
 private:
     std::shared_ptr<const SourcePort::ResourceBytes> dictionary_bytes_;
-    bool AddAssets(std::vector<SourcePort::TextureAsset>, uint32 disk_checksum=0);
+    bool AddAssets(std::vector<SourcePort::TextureAsset>, uint32 disk_checksum, const char* name);
     CTexture* plat_load_texture(const char*,bool,bool)override;
     CTexture* plat_load_texture_from_buffer(uint8*,int,uint32,bool,bool)override;
     CTexture* plat_reload_texture(const char*)override;

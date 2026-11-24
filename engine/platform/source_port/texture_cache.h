@@ -16,6 +16,7 @@ struct TextureCacheEntry {
     unsigned sample_width = 0, sample_height = 0;
     SourceTextureFormat format = SOURCE_TEXTURE_RGBA8;
     std::size_t offset = 0, bytes = 0;
+    uint32 distant_color = 0; // RGB from the smallest opaque ETC mip, high byte marks validity
 };
 
 std::size_t NativeTextureLevelBytes(SourceTextureFormat format, unsigned width, unsigned height);

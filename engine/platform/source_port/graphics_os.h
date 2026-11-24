@@ -176,6 +176,9 @@ int source_graphics_texture_update(SourceGpuTexture*,const uint8_t*,size_t);
 // Resource mutation acquires a completed writable frame. Submission reuses
 // that frame, then fences the next mutation; UI never rewrites live buffers.
 int source_graphics_submit(const SourceDrawPacket*,size_t,uint32_t,float);
+int source_graphics_low_target_active(void);
+enum { SOURCE_OLD_WORLD_WIDTH=308, SOURCE_OLD_WORLD_HEIGHT=184 };
+int source_graphics_submit_low(const SourceDrawPacket*,size_t count,size_t world_count,uint32_t clear,float stereo,int bounded);
 int source_graphics_submit_bounded(const SourceDrawPacket*,size_t,uint32_t,float);
 void source_graphics_fast_index_commands(int enabled);
 int source_graphics_submit_frame(const SourceDrawPacket*,size_t,uint32_t,float,int clear_color);

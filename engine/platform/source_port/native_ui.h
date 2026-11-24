@@ -28,6 +28,7 @@ public:
     void Release();
 private:
     SourceGpuMesh* mesh_=nullptr;std::vector<SourceRenderVertex> vertices_;
+    std::size_t uploaded_vertices_=0;
 };
 }
 namespace Nx {

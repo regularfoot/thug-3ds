@@ -3,6 +3,7 @@
 #include <source_port/batch_sort.h>
 #include <source_port/native_fog.h>
 #include <source_port/graphics.h>
+#include <source_port/diagnostics.h>
 #include <source_port/thread_os.h>
 #include <source_port/application_os.h>
 #include <algorithm>
@@ -917,13 +918,28 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
     auto& packets=packets_;
     packets.clear();
     packets.reserve(runs.size());
+    const Mth::Matrix* last_skin_model=nullptr;
+    bool last_relative=false;
+    float skin_view[16];
+    const auto upload_failure = [](const char* part, unsigned texture, std::size_t vertices, std::size_t indices) {
+        const int error = errno;
+        SourceGraphicsStats stats{};
+        source_graphics_stats(&stats);
+        Log("WORLD_UPLOAD_FAILURE part=%s errno=%d texture=%08x vertices=%zu indices=%zu linear_free=%u vram_free=%u",
+            part, error, texture, vertices, indices, stats.linear_free, stats.vram_free);
+        errno = error;
+        return false;
+    };
     for(std::size_t i=0;i<runs.size();++i){const auto& run=runs[i];const auto& b=*run.first;SourceDrawPacket packet=b.camera_relative?relative:(b.sky||b.fog_disabled?unfogged:normal);
         PrepareWorldMaterial(b,packet);
         // Keep the original sky preamble in the sequence, including any
         // blended sky layers that precede the depth-writing world.
         const bool depth_opaque=b.opaque&&base_depth_draw(b)&&!b.environment;
         packet.early_opaque=b.sky?1:(view.vancouver_early?(depth_opaque&&b.retained?2:0):unsigned(depth_opaque));
-        if(b.texture){packet.texture=b.texture->GPU();if(!packet.texture)return false;}
+        if (b.texture) {
+            packet.texture=b.texture->GPU();
+            if (!packet.texture) return upload_failure("texture", b.texture->GetChecksum(), run.count, run.IndexCount());
+        }
         const auto& choice=choices[i];
         if(b.skin_mesh){
             packet.mesh=b.skin_mesh;
@@ -933,14 +949,18 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
             const auto gpu_v=[&](float v){return b.mesh_uv?b.texture->ModelGPUV(v):b.texture->GPUV(v);};
             packet.skin_v_offset=b.texture?gpu_v(0):0;
             packet.skin_v_scale=b.texture?gpu_v(1)-packet.skin_v_offset:1;
-            float camera[16];
-            std::copy_n(packet.model_view,16,camera);
-            const auto& model=*b.skin_transform;
-            for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c){
-                float result=0;
-                for(unsigned k=0;k<4;++k)result+=camera[r*4+k]*model[c][k];
-                packet.model_view[r*4+c]=result;
+            const auto* model=b.skin_transform;
+            if(!last_skin_model || b.camera_relative!=last_relative ||
+               (model!=last_skin_model && std::memcmp(&(*model)[0][0],&(*last_skin_model)[0][0],sizeof skin_view)!=0)){
+                for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c){
+                    float result=0;
+                    for(unsigned k=0;k<4;++k)result+=packet.model_view[r*4+k]*(*model)[c][k];
+                    skin_view[r*4+c]=result;
+                }
+                last_relative=b.camera_relative;
             }
+            last_skin_model=model;
+            std::copy_n(skin_view,16,packet.model_view);
         }else if(choice.keep){
             auto at=choice.resident;
             if(at==resident_.end()){
@@ -961,7 +981,8 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
                     return writer.Append(data.run,data.us,data.v0,data.v1,data.packet)&&writer.Full()?0:-1;
                 };
                 SourceGpuMesh* gpu=nullptr;
-                if(source_graphics_stream_write(&gpu,run.count,run.IndexCount(),run.indexed,write,&upload))return false;
+                if(source_graphics_stream_write(&gpu,run.count,run.IndexCount(),run.indexed,write,&upload))
+                    return upload_failure("resident", 0, run.count, run.IndexCount());
                 NativeHeapScope storage;
                 Resident item;
                 item.source_strip=run.source_strip;
@@ -1027,7 +1048,8 @@ bool NativeWorldBatch::Prepare(const WorldView& view,const std::vector<WorldBatc
             return view.city_prop_radius>0?used+std::min(used/8,std::size_t(2048)):used;
         };
         SourceStreamCapacity space{capacity(dynamic_vertices),capacity(dynamic_indices)};
-        if(source_graphics_stream_write_reserved(&streaming_.gpu,dynamic_vertices,dynamic_indices,dynamic_ranges,write,&upload,&space))return false;
+        if(source_graphics_stream_write_reserved(&streaming_.gpu,dynamic_vertices,dynamic_indices,dynamic_ranges,write,&upload,&space))
+            return upload_failure("stream", 0, dynamic_vertices, dynamic_indices);
         if(creating){streaming_.capacity=space.vertices;streaming_.index_capacity=space.indices;}
         for(auto& packet:packets)if(!packet.mesh)packet.mesh=streaming_.gpu;
     }

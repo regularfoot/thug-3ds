@@ -3,6 +3,7 @@
 #ifdef __3DS__
 #include <3ds.h>
 #include <source_port/application.h>
+#include <source_port/application_os.h>
 #include <source_port/diagnostics.h>
 #include <cerrno>
 #include <source_port/audio_os.h>
@@ -15,6 +16,9 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <array>
+#include <cstdio>
+#include <cstring>
 
 namespace {
 enum class End {Complete,Skip,SkipOpening,Quit,Failed};
@@ -31,7 +35,40 @@ void fill_audio(SourcePort::Voice& voice){
     }
 }
 
-End movie(const char* request){
+// Fixed-rate ETC1 frames are already in PICA tile order. Keeping the file
+// open also avoids seeking through the interleaved retail audio/video stream.
+class OldOpening {
+public:
+    static constexpr unsigned Width=256, Height=128, Bytes=Width*Height/2, Fps=24;
+    ~OldOpening() { if (file_) std::fclose(file_); }
+    bool Open(const std::string& path) {
+        char resolved[1024];
+        if (!SourcePort::ResolveResourcePath(path.c_str(),resolved,sizeof(resolved))) return false;
+        file_=std::fopen(resolved,"rb");
+        if (!file_) return false;
+        constexpr std::array<unsigned char,16> expected={'T','H','V','1',0,1,128,0,Fps,0,0,0,1,0,0,0};
+        std::array<unsigned char,16> header;
+        if (std::fread(header.data(),1,header.size(),file_)!=header.size() || header!=expected ||
+            std::fseek(file_,0,SEEK_END)!=0) return false;
+        const long size=std::ftell(file_);
+        if (size<=long(header.size()) || (size-long(header.size()))%Bytes ||
+            std::fseek(file_,header.size(),SEEK_SET)!=0) return false;
+        remaining_=(size-header.size())/Bytes;
+        return true;
+    }
+    int Read(std::vector<uint8_t>& frame) {
+        if (!remaining_) return 0;
+        frame.resize(Bytes);
+        if (std::fread(frame.data(),1,Bytes,file_)!=Bytes) return -1;
+        --remaining_;
+        return 1;
+    }
+private:
+    std::FILE* file_=nullptr;
+    unsigned remaining_=0;
+};
+
+End movie(const char* request, bool opening=false){
     if(!request||playing)return End::Failed;
     std::string name=request;
     std::replace(name.begin(),name.end(),'\\','/');
@@ -44,29 +81,35 @@ End movie(const char* request){
     const auto path="movies/bik/"+name+".bik";
     char resolved[1024];
     SourcePort::MovieVideo video;
-    if(!SourcePort::ResolveResourcePath(path.c_str(),resolved,sizeof(resolved))){
+    OldOpening old;
+    const auto prefix="movies/old/"+name;
+    SourcePort::Voice voice;
+    voice.stream=std::make_unique<SourcePort::MediaDecoder>();
+    const bool compact=opening && source_application_os_is_old_3ds() && old.Open(prefix+".etv") &&
+        voice.stream->Open((prefix+".wav").c_str());
+    if(!compact && !SourcePort::ResolveResourcePath(path.c_str(),resolved,sizeof(resolved))){
         SourcePort::Log("MOVIE_OPEN_ERROR path=%s stage=path errno=%d",path.c_str(),errno);
         return End::Failed;
     }
-    if(!video.Open(resolved))
+    if(!compact && !video.Open(resolved))
         return End::Failed;
 
-    SourcePort::Voice voice;
-    voice.stream=std::make_unique<SourcePort::MediaDecoder>();
-    if(voice.stream->Open(path.c_str())){
+    if(compact || voice.stream->Open(path.c_str())){
         voice.rate=voice.stream->Rate();
         source_audio_discard();
         voice.Begin();
     }else voice.stream.reset();
 
     using Video=SourcePort::MovieVideo;
-    constexpr float u0=.5f/Video::TextureWidth,u1=(Video::Width-.5f)/Video::TextureWidth;
-    constexpr float v0=1-.5f/Video::TextureHeight,v1=1-(Video::Height-.5f)/Video::TextureHeight;
+    const unsigned tw=compact?OldOpening::Width:Video::TextureWidth;
+    const unsigned th=compact?OldOpening::Height:Video::TextureHeight;
+    const float u0=.5f/tw, u1=((compact?tw:Video::Width)-.5f)/tw;
+    const float v0=1-.5f/th, v1=1-((compact?th:Video::Height)-.5f)/th;
     // Preserve the source 4:3 aspect on the 400x240 display.
-    constexpr SourceRenderVertex a{64,0,0,255,255,255,255,u0,v0};
-    constexpr SourceRenderVertex b{64,448,0,255,255,255,255,u0,v1};
-    constexpr SourceRenderVertex c{576,448,0,255,255,255,255,u1,v1};
-    constexpr SourceRenderVertex d{576,0,0,255,255,255,255,u1,v0};
+    const SourceRenderVertex a{64,0,0,255,255,255,255,u0,v0};
+    const SourceRenderVertex b{64,448,0,255,255,255,255,u0,v1};
+    const SourceRenderVertex c{576,448,0,255,255,255,255,u1,v1};
+    const SourceRenderVertex d{576,0,0,255,255,255,255,u1,v0};
     const SourceRenderVertex quad[]={a,b,c,a,c,d};
     auto* mesh=source_graphics_mesh_create(quad,6);
     if(!mesh){
@@ -82,7 +125,7 @@ End movie(const char* request){
     packet.orthographic=1;
     for(unsigned i=0;i<4;++i)packet.model_view[5*i]=1;
     std::vector<uint8_t> tiled;
-    const auto hz=source_clock_frequency(),interval=video.FrameTicks(hz);
+    const auto hz=source_clock_frequency(),interval=compact?hz/OldOpening::Fps:video.FrameTicks(hz);
     std::uint64_t due=0,last=0;
     unsigned decoded=0,shown=0;
     End end=End::Complete;
@@ -96,12 +139,12 @@ End movie(const char* request){
         fill_audio(voice);
         return End::Complete;
     };
-    SourcePort::Log("MOVIE_BEGIN name=%s audio=%u",name.c_str(),voice.rate);
+    SourcePort::Log("MOVIE_BEGIN name=%s audio=%u format=%s",name.c_str(),voice.rate,compact?"etc1":"bink");
     SourcePort::CheckpointDiagnosticLog();
     for(;;){
         end=poll();
         if(end!=End::Complete)break;
-        const int read=video.Read();
+        const int read=compact?old.Read(tiled):video.Read();
         if(read<=0){if(read<0)end=End::Failed;break;}
         ++decoded;
         auto now=source_clock_now();
@@ -114,8 +157,9 @@ End movie(const char* request){
         }
         if(end!=End::Complete)break;
         if(now<=due+interval||now-last>=hz/10){
-            video.Tile(tiled);
-            if(!packet.texture)packet.texture=source_graphics_texture_create(Video::TextureWidth,Video::TextureHeight,tiled.data(),tiled.size());
+            if(!compact)video.Tile(tiled);
+            if(!packet.texture)packet.texture=source_graphics_texture_create_format(tw,th,
+                compact?SOURCE_TEXTURE_ETC1:SOURCE_TEXTURE_RGBA8,tiled.data(),tiled.size());
             else if(source_graphics_texture_update(packet.texture,tiled.data(),tiled.size())!=0){end=End::Failed;break;}
             if(!packet.texture||source_graphics_submit(&packet,1,0x000000ff,0)!=0){end=End::Failed;break;}
             last=now;
@@ -159,7 +203,7 @@ void PlayOpeningMovies(){
         return;
     }
     for(const char* name:{"atvi","nslogo","intro"}){
-        auto end=movie(name);
+        auto end=movie(name,true);
         if(end==End::Failed)Log("MOVIE_UNAVAILABLE name=%s",name);
         if(end==End::SkipOpening||end==End::Quit)break;
     }

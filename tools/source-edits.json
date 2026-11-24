@@ -1238,6 +1238,46 @@
     ]
    ]
   },
+  "gel/components/shadowcomponent.cpp": {
+   "sha256": "15685dfcbefafdcf46461caba6aa3ed3e5a51e0b5fc7fc5b2ec0d38ee9d7df3f",
+   "edits": [
+    [
+     329,
+     329,
+     [
+      "#include <source_port/application_os.h>\n"
+     ]
+    ],
+    [
+     3563,
+     3563,
+     [
+      "\tif(source_application_os_is_old_3ds()){SwitchOffShadow(); m_shadowType=0;return;}\n"
+     ]
+    ],
+    [
+     8771,
+     8771,
+     [
+      "\tif(source_application_os_is_old_3ds()){return;}\n"
+     ]
+    ],
+    [
+     11560,
+     11560,
+     [
+      "\tif(source_application_os_is_old_3ds()){return;}\n"
+     ]
+    ],
+    [
+     15708,
+     15708,
+     [
+      "\tif(source_application_os_is_old_3ds()){return;}\n"
+     ]
+    ]
+   ]
+  },
   "gel/components/skeletoncomponent.cpp": {
    "sha256": "67a7beb694e3d4855e0cc6f6821d6227a67b57e4fd2eacf185266b49bf111f1a",
    "edits": [
@@ -2052,13 +2092,20 @@
    ]
   },
   "gel/scripting/script.cpp": {
-   "sha256": "0e139113ec9d340bd3d1be3be61385b0d3748863083ab4ebf04028a3644cfb9b",
+   "sha256": "5d38164b41978be76f861ecebfe7098b57b6a718af51e2c389d4df8afb576bb1",
    "edits": [
     [
      311,
      311,
      [
-      "#include <source_port/logic_timing.h>\n"
+      "#include <source_port/logic_timing.h>\n#include <source_port/launch_paths.h>\n"
+     ]
+    ],
+    [
+     21554,
+     21554,
+     [
+      "\tif(SourcePort::OmitSceneryScript(scriptChecksum)){ClearScript(); return;}\n"
      ]
     ],
     [
@@ -10727,7 +10774,7 @@
    ]
   },
   "sk/modules/skate/skate.cpp": {
-   "sha256": "3b8fa96d441d43a4b0233bfce1182cf3b521a8ea72b5d0c0e8c7003206aa9b99",
+   "sha256": "8298482f37d7395e4a718742438c55ea5d1c41fa8203437dcfebaf9e8fc54967",
    "edits": [
     [
      1320,
@@ -10761,6 +10808,13 @@
      ]
     ],
     [
+     1818,
+     1818,
+     [
+      "#include <source_port/launch_paths.h>\n"
+     ]
+    ],
+    [
      27077,
      27077,
      [
@@ -10772,6 +10826,13 @@
      46525,
      [
       "\n\tif (gbQuit)\n\t{\n\t\tdelete spCATData;\n\t\tspCATData = nullptr;\n\t\tdelete spStatData;\n\t\tspStatData = nullptr;\n\t}\n"
+     ]
+    ],
+    [
+     76807,
+     76807,
+     [
+      "\tif (SourcePort::OmitAmbientNode(pNode)) return true;\n"
      ]
     ]
    ]
@@ -11055,8 +11116,15 @@
    ]
   },
   "sk/parkeditor2/parkgen.cpp": {
-   "sha256": "3e6766c3967208b6a57a6f9a3dd2733b89583e10e11c0f5c3aed57d94335da31",
+   "sha256": "f8d3cac5d3a1c5d992be8922c41d0cccbc63cd3d0652aa34393463124f86906a",
    "edits": [
+    [
+     62,
+     62,
+     [
+      "#include <source_port/application_os.h>\n"
+     ]
+    ],
     [
      8409,
      8409,
@@ -11075,6 +11143,13 @@
      8443,
      8590,
      []
+    ],
+    [
+     40018,
+     40018,
+     [
+      "\n\tif (source_application_os_is_old_3ds()) return;"
+     ]
     ],
     [
      40177,
@@ -11155,8 +11230,29 @@
    ]
   },
   "sk/scripting/cfuncs.cpp": {
-   "sha256": "1b303f431e72cbec9a389d73e269b35495e76e974866308730a55433bc2532f3",
+   "sha256": "31f0877468c6b712861b2f1d05017b3e76dbbcb59623a7fd43bfeb589dfd159c",
    "edits": [
+    [
+     647,
+     647,
+     [
+      "#include <source_port/launch_paths.h>\n"
+     ]
+    ],
+    [
+     681,
+     681,
+     [
+      "#include <source_port/diagnostics.h>\n"
+     ]
+    ],
+    [
+     3281,
+     3281,
+     [
+      "\n#include <source_port/application_os.h>"
+     ]
+    ],
     [
      5316,
      5316,
@@ -11172,10 +11268,45 @@
      ]
     ],
     [
+     137258,
+     137258,
+     [
+      "\tif (source_application_os_is_old_3ds()) return true;\n"
+     ]
+    ],
+    [
+     140695,
+     140695,
+     [
+      "\tif (source_application_os_is_old_3ds()) return true;\n"
+     ]
+    ],
+    [
+     142628,
+     142628,
+     [
+      "\t\tif (source_application_os_is_old_3ds()) return true;\n"
+     ]
+    ],
+    [
+     143172,
+     143172,
+     [
+      "\tif (source_application_os_is_old_3ds()) return true;\n"
+     ]
+    ],
+    [
      158608,
      158608,
      [
       "\t\t\t// The resolved argument is borrowed from QB.\n\t\t\tsTempComponent.mUnion=0;\n\t\t\tsTempComponent.mType=ESYMBOLTYPE_NONE;\n"
+     ]
+    ],
+    [
+     166091,
+     166091,
+     [
+      "\tif (SourcePort::OldFreeSkateAmbientDisabled() && SourcePort::IsAmbientModelPath(pModelName)) return true;\n"
      ]
     ],
     [
@@ -11263,10 +11394,139 @@
      ]
     ],
     [
+     186623,
+     186623,
+     [
+      " || SourcePort::OldFreeSkateAmbientDisabled()"
+     ]
+    ],
+    [
+     202473,
+     202473,
+     [
+      "\tunsigned skipped_peds = 0, skipped_vehicles = 0, skipped_effects = 0, skipped_props = 0;\n"
+     ]
+    ],
+    [
+     211215,
+     211217,
+     [
+      "if"
+     ]
+    ],
+    [
+     211218,
+     211223,
+     [
+      "(SourcePort::OldFreeSkateAmbientDisabled())"
+     ]
+    ],
+    [
+     211224,
+     211229,
+     [
+      "{\n                switch"
+     ]
+    ],
+    [
+     211230,
+     211232,
+     [
+      [
+       177824,
+       177839
+      ]
+     ]
+    ],
+    [
+     211233,
+     211237,
+     [
+      "{\n                    case"
+     ]
+    ],
+    [
+     211238,
+     211239,
+     [
+      "0xa0dfac98:"
+     ]
+    ],
+    [
+     211240,
+     211243,
+     [
+      "case"
+     ]
+    ],
+    [
+     211244,
+     211248,
+     [
+      "0x061a741e: ++skipped_peds; break;\n                    case 0xe47f1b79: ++skipped_vehicles; break;\n                    case 0x19b1e241: case 0x9e7d469e: ++skipped_effects; break;\n                    case 0xef59c100: ++skipped_props; break;\n                }\n            }"
+     ]
+    ],
+    [
+     212181,
+     212181,
+     [
+      "    if (SourcePort::OldFreeSkateAmbientDisabled())\n        SourcePort::Log(\"OLD_FREE_SKATE peds=%u vehicles=%u particle_nodes=%u ambient_props=%u\",\n                        skipped_peds, skipped_vehicles, skipped_effects, skipped_props);\n"
+     ]
+    ],
+    [
+     212700,
+     212700,
+     [
+      "const int light_node_count = source_application_os_is_old_3ds() ? 0 : pNodeArray->GetSize();\n\t"
+     ]
+    ],
+    [
+     212712,
+     212733,
+     [
+      "light_node_count"
+     ]
+    ],
+    [
      380978,
      380978,
      [
       " || defined(__PLAT_N3DS__)"
+     ]
+    ],
+    [
+     421895,
+     421895,
+     [
+      "\tif (!perm && SourcePort::OldFreeSkateAmbientDisabled()) return true;\n"
+     ]
+    ],
+    [
+     423709,
+     423709,
+     [
+      "\tif (!p_particle && SourcePort::OldFreeSkateAmbientDisabled()) return false;\n"
+     ]
+    ],
+    [
+     424820,
+     424820,
+     [
+      "\tif (SourcePort::OldFreeSkateAmbientDisabled() && !Nx::get_particle(name)) return true;\n"
+     ]
+    ],
+    [
+     425588,
+     425588,
+     [
+      "\tif (!p_particle && SourcePort::OldFreeSkateAmbientDisabled()) return false;\n"
+     ]
+    ],
+    [
+     436935,
+     436935,
+     [
+      "#ifdef __3DS__\n    // Retail Load_Sk5Ed chooses its level loader by asset platform only.\n    if (pScript && pScript->mScriptChecksum == CRCD(0xe8b4b836, \"load_sk5ed\")) return true;\n#endif\n"
      ]
     ],
     [
@@ -11760,8 +12020,22 @@
    ]
   },
   "sk/scripting/skfuncs.cpp": {
-   "sha256": "7deb949135356c68887a031f962945a8ae17ce293567385ee29b6c9d0733a409",
+   "sha256": "3c7ccf179b8fbdf27e1dd4d5ffac358afdcd2e324800a3edee05420bfc9e87d2",
    "edits": [
+    [
+     649,
+     649,
+     [
+      "#include <source_port/launch_paths.h>\n"
+     ]
+    ],
+    [
+     21346,
+     21346,
+     [
+      "\tif (SourcePort::OldFreeSkateAmbientDisabled()) return false;\n"
+     ]
+    ],
     [
      27927,
      27927,
@@ -14482,6 +14756,70 @@
      958,
      [
       ") || defined(__PLAT_N3DS__)"
+     ]
+    ]
+   ]
+  },
+  "sk/components/editorcameracomponent.cpp": {
+   "sha256": "55c63215a4c43bd7236fafc8847c0db342e36026d63d45877652f9259d38152e",
+   "edits": [
+    [
+     344,
+     344,
+     [
+      "#include <source_port/application_os.h>\n"
+     ]
+    ],
+    [
+     10202,
+     10202,
+     [
+      "\tif (source_application_os_is_old_3ds()) return;\n"
+     ]
+    ],
+    [
+     10503,
+     10503,
+     [
+      "\tif (source_application_os_is_old_3ds()) return;\n"
+     ]
+    ]
+   ]
+  },
+  "gel/components/modelcomponent.cpp": {
+   "sha256": "ca25d83606f59fa23c2ec7fbcd98745f00639cf6bc2df5396045eeea397e0d4e",
+   "edits": [
+    [
+     341,
+     341,
+     [
+      "#include <source_port/application_os.h>\n"
+     ]
+    ],
+    [
+     59973,
+     59973,
+     [
+      "\tif (source_application_os_is_old_3ds()) return;\n"
+     ]
+    ]
+   ]
+  },
+  "gel/components/modellightupdatecomponent.cpp": {
+   "sha256": "98ba98326b3d2f1db4e0157b9ae0e1f2289dd8d4fd0130e36a581b4fb15d915f",
+   "edits": [
+    [
+     804,
+     804,
+     [
+      "#include <source_port/application_os.h>\n"
+     ]
+    ],
+    [
+     3776,
+     3776,
+     [
+      "\tif (source_application_os_is_old_3ds()) return;\n"
      ]
     ]
    ]

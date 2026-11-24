@@ -78,8 +78,9 @@ void write_disk_pre(const char* archive, const fs::path& target) {
     std::printf("Packed %zu original members into %s (%u bytes)\n", members.size(), target.c_str(), offset);
 }
 
-void write_aligned_animations(const fs::path& target) {
-    auto* raw = static_cast<uint8*>(File::LoadAllocNoPre("pre/unloadableanims.pre"));
+void write_aligned_animations(const std::string& archive, const fs::path& directory) {
+    const auto target = directory / (archive + ".apre");
+    auto* raw = static_cast<uint8*>(File::LoadAllocNoPre(("pre/" + archive + ".pre").c_str()));
     Dbg_Assert(raw);
     std::uint32_t byte_count = 0, member_count = 0;
     std::memcpy(&byte_count, raw, 4);
@@ -126,7 +127,8 @@ int main(int argc,char** argv){
             if (argc == 4) {
                 for (const char* archive : {"skaterparts", "skater_sounds", "themes", "sc2scn", "sc2", "sc2ped"})
                     write_disk_pre(archive, fs::path(argv[3]) / (std::string(archive) + ".pak"));
-                write_aligned_animations(fs::path(argv[3]) / "unloadableanims.apre");
+                for (const char* archive : {"unloadableanims", "netanims"})
+                    write_aligned_animations(archive, argv[3]);
             }
             for (int i = 4; i < argc; ++i) {
                 std::string archive = argv[i];

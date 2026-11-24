@@ -27,17 +27,23 @@ int16_t pack_uv(float value, uint32 index, std::vector<WideUV>& wide) {
 
 void report_compact_scene(const char* name, const SceneAsset& asset) {
     std::size_t vertices = 0, original = 0, packed = 0;
+    std::size_t grid_vertices = 0;
     for (const auto& sector : asset.sectors) {
-        if (sector.static_vertices.empty()) continue;
+        if (!sector.vertices.empty() || !sector.VertexCount()) continue;
         vertices += sector.VertexCount();
         original += sector.VertexCount() * sizeof(AssetVertex) +
             sector.VertexCount() * sector.uv_sets * sizeof(std::array<float, 2>);
-        packed += sector.static_vertices.capacity() * sizeof(StaticAssetVertex) +
-            sector.static_normals.capacity() * sizeof(std::array<float, 3>) +
+        if (const auto* grid = std::get_if<GridVertices>(&sector.static_vertices)) {
+            grid_vertices += grid->values.size();
+            packed += grid->values.capacity() * sizeof(GridVertex);
+        } else {
+            packed += std::get<std::vector<StaticAssetVertex>>(sector.static_vertices).capacity() * sizeof(StaticAssetVertex);
+        }
+        packed += sector.static_normals.capacity() * sizeof(std::array<float, 3>) +
             sector.static_wibble.capacity() + sector.packed_uv.capacity() * sizeof(int16_t) +
             sector.wide_uv.capacity() * sizeof(WideUV) + sector.uv.capacity() * sizeof(std::array<float, 2>);
     }
-    Log("STATIC_STREAMS scene=%s vertices=%zu old_bytes=%zu bytes=%zu", name, vertices, original, packed);
+    Log("STATIC_STREAMS scene=%s vertices=%zu old_bytes=%zu bytes=%zu grid_vertices=%zu", name, vertices, original, packed, grid_vertices);
 }
 
 template<std::size_t N>void floats(ResourceReader& r,std::array<float,N>& a){for(auto& v:a)v=r.F32();}
@@ -70,7 +76,7 @@ bool materials(ResourceReader& r,std::vector<MaterialAsset>& out){
         if(!r.Ok())return false;
     }return r.Ok();
 }
-bool parse_scene(ResourceReader& r, SceneAsset& out, bool compact_static){
+bool parse_scene(ResourceReader& r, SceneAsset& out, SceneVertexStorage storage){
     SceneAsset scene;
     for(auto& version:scene.versions){version=r.U32();if(!version||version>64)return r.Fail("unsupported scene versions");}
     r.Context("materials");if(!materials(r,scene.materials))return false;auto count=r.U32();if(!r.Count(count,64,65535))return false;
@@ -86,12 +92,13 @@ bool parse_scene(ResourceReader& r, SceneAsset& out, bool compact_static){
         if(sector.flags&0x00800000){sector.billboard_type=r.U32();source_bounds(r,sector.billboard);}
         auto vertices=r.U32();sector.stride=r.U32();total_vertices+=vertices;
         if(total_vertices>1000000||!r.Count(vertices,12,65535))return r.Fail("invalid sector vertices");
-        const bool compact = compact_static && vertices && sector.bone < 0 && !(sector.flags & (16 | 0x00800000));
-        if (compact) sector.static_vertices.resize(vertices);
+        const bool compact = storage != SceneVertexStorage::Full && vertices && sector.bone < 0 && !(sector.flags & (16 | 0x00800000));
+        auto& plain = std::get<std::vector<StaticAssetVertex>>(sector.static_vertices);
+        if (compact) plain.resize(vertices);
         else sector.vertices.resize(vertices);
         r.Context("positions");
         for (unsigned i=0;i<vertices;++i)
-            floats(r, compact ? sector.static_vertices[i].position : sector.vertices[i].position);
+            floats(r, compact ? plain[i].position : sector.vertices[i].position);
         r.Context("normals");
         if (sector.flags & 4) {
             if (compact) sector.static_normals.resize(vertices);
@@ -120,7 +127,8 @@ bool parse_scene(ResourceReader& r, SceneAsset& out, bool compact_static){
             }
         }
         if (sector.flags & 2) for (unsigned i=0;i<vertices;++i)
-            (compact ? sector.static_vertices[i].color : sector.vertices[i].color) = r.U32();
+            (compact ? plain[i].color : sector.vertices[i].color) = r.U32();
+        if (compact && storage == SceneVertexStorage::ExactGrid && r.Ok()) sector.PackStaticPositions();
         if (sector.flags & 0x800) {
             if (compact) sector.static_wibble.resize(vertices);
             for (unsigned i=0;i<vertices;++i)
@@ -204,11 +212,45 @@ private:
 };
 }
 
+void SectorAsset::PackStaticPositions() {
+    const auto* plain = std::get_if<std::vector<StaticAssetVertex>>(&static_vertices);
+    if (!plain || plain->size() < 4) return;
+    std::array<int32_t, 3> low, high;
+    low.fill(std::numeric_limits<int32_t>::max());
+    high.fill(std::numeric_limits<int32_t>::min());
+    for (const auto& v : *plain) {
+        for (unsigned axis = 0; axis < 3; ++axis) {
+            const float value = v.position[axis];
+            const float scaled = value * 16.f;
+            // Within this interval both conversions are exact, including on ARM.
+            // Preserve negative zero by keeping the original floats for its sector.
+            if (!(scaled >= -16777216.f && scaled <= 16777216.f) ||
+                (value == 0.f && std::signbit(value))) return;
+            const auto cell = static_cast<int32_t>(scaled);
+            if (float(cell) != scaled) return;
+            low[axis] = std::min(low[axis], cell);
+            high[axis] = std::max(high[axis], cell);
+            if (high[axis] - low[axis] > 65535) return;
+        }
+    }
+    GridVertices grid{low, {}};
+    grid.values.reserve(plain->size());
+    for (const auto& v : *plain) {
+        GridVertex packed;
+        for (unsigned axis = 0; axis < 3; ++axis)
+            packed.delta[axis] = uint16_t(int32_t(v.position[axis] * 16.f) - low[axis]);
+        packed.color_low = uint16_t(v.color);
+        packed.color_high = uint16_t(v.color >> 16);
+        grid.values.push_back(packed);
+    }
+    static_vertices = std::move(grid);
+}
+
 AssetVertex SectorAsset::Vertex(std::size_t index) const {
     if (!vertices.empty()) return vertices[index];
     AssetVertex result;
-    result.position = static_vertices[index].position;
-    result.color = static_vertices[index].color;
+    result.position = Position(index);
+    result.color = Color(index);
     if (!static_normals.empty()) result.normal = static_normals[index];
     if (!static_wibble.empty()) result.color_wibble = static_wibble[index];
     return result;
@@ -235,16 +277,16 @@ std::array<float, 2> SectorAsset::UV(std::size_t index) const {
     return result;
 }
 
-bool ReadScene(const void* bytes, std::size_t size, SceneAsset& out, ResourceError* error, bool compact_static) {
+bool ReadScene(const void* bytes, std::size_t size, SceneAsset& out, ResourceError* error, SceneVertexStorage storage) {
     ResourceReader reader(bytes, size, error);
-    return parse_scene(reader, out, compact_static);
+    return parse_scene(reader, out, storage);
 }
 
 bool ReadScene(std::shared_ptr<const ResourceBytes> bytes, SceneAsset& out, ResourceError* error) {
     return bytes && ReadScene(bytes->data(), bytes->size(), out, error);
 }
 
-bool ReadSceneResource(const char* name, SceneAsset& out, ResourceError* error, SceneSignature* signature, bool compact_static) {
+bool ReadSceneResource(const char* name, SceneAsset& out, ResourceError* error, SceneSignature* signature, SceneVertexStorage storage) {
     if (error) *error = {};
     if (!name || !*name || std::strlen(name) >= 128) return false;
     const auto* entry = File::PreMgr::sPreEnabled() ? File::PreMgr::Instance()->FindFileEntry(name) : nullptr;
@@ -256,11 +298,11 @@ bool ReadSceneResource(const char* name, SceneAsset& out, ResourceError* error, 
 
     if (entry && (entry->pData || !entry->compressedDataSize)) {
         const auto* data = entry->pData ? entry->pData : entry->pCompressedData;
-        if (!ReadScene(data, size, out, error, compact_static)) return false;
+        if (!ReadScene(data, size, out, error, storage)) return false;
         if (signature) *signature = {std::size_t(size), Crc::GenerateCRCCaseSensitive(
             reinterpret_cast<const char*>(data), int(size))};
         SourcePort::Log("SCENE_SOURCE mode=borrowed bytes=%u scratch=0 name=%s", unsigned(size), name);
-        if (compact_static) report_compact_scene(name, out);
+        if (storage != SceneVertexStorage::Full) report_compact_scene(name, out);
         return true;
     }
 
@@ -277,7 +319,7 @@ bool ReadSceneResource(const char* name, SceneAsset& out, ResourceError* error, 
     // reduces FS requests without keeping a second copy of the whole scene.
     std::array<uint8, SceneStream::chunk_size> small_buffer;
     ResourceBytes read_ahead;
-    if (!entry && compact_static && source_application_os_is_new_3ds() && size >= 512*1024)
+    if (!entry && storage != SceneVertexStorage::Full && source_application_os_is_new_3ds() && size >= 512*1024)
         read_ahead.resize(64*1024);
     auto* buffer = read_ahead.empty() ? small_buffer.data() : read_ahead.data();
     const auto buffer_size = read_ahead.empty() ? small_buffer.size() : read_ahead.size();
@@ -287,8 +329,8 @@ bool ReadSceneResource(const char* name, SceneAsset& out, ResourceError* error, 
     SourcePort::Log("SCENE_SOURCE mode=%s bytes=%u scratch=%u name=%s",
         entry ? "lzss" : "disk", unsigned(size), unsigned(sizeof(stream) + buffer_size), name);
     ResourceReader reader(size, error, fill, &stream, buffer, buffer_size);
-    if (!parse_scene(reader, out, compact_static)) return false;
-    if (compact_static) report_compact_scene(name, out);
+    if (!parse_scene(reader, out, storage)) return false;
+    if (storage != SceneVertexStorage::Full) report_compact_scene(name, out);
     if (signature) *signature = {std::size_t(size), stream.checksum};
     return true;
 }

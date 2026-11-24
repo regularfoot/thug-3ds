@@ -72,7 +72,9 @@ void RefreshInput() {
         if(f>=240){
             const auto step=(f-240)/36;
             const unsigned confirm=4u+unsigned(FreeSkateTrialLevel());
-            if(step>confirm)menu_test_frame=0;
+            if (FreeSkateTrialLevel()==9 && step==confirm+1) {
+                if ((f-240)%36<3) sample.buttons=cross; // Play Park in the Created Parks submenu
+            } else if(step>confirm)menu_test_frame=0;
             else if((f-240)%36<3)sample.buttons=step<4?enter_free_skate[step]:(step==confirm?cross:down);
         }
     }

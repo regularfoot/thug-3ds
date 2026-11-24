@@ -1,6 +1,8 @@
 #include <source_port/texture_cache.h>
+#include <source_port/application_os.h>
 #include <source_port/world_texture_bank.h>
 #include <source_port/memory.h>
+#include <source_port/diagnostics.h>
 #include <sys/file/filesys.h>
 #include <algorithm>
 #include <tuple>
@@ -82,7 +84,10 @@ const IndexEntry* FindIndexEntry(uint32 checksum, uint32 size, TextureSource kin
         loaded = true;
         if (auto* file = OpenCache(cache)) {
             if (!SeekCache(file,0) ||
-                !(venice ? LoadIndex(file,venice_index,count) : LoadIndex(file,index,count))) DropCacheHandle(cache);
+                !(venice ? LoadIndex(file,venice_index,count) : LoadIndex(file,index,count))) {
+                Log("TEXTURE_CACHE_INVALID file=%s stage=index", CachePath(cache));
+                DropCacheHandle(cache);
+            }
         }
     }
     if (!count) return nullptr;
@@ -111,6 +116,24 @@ std::size_t NativeTextureLevelBytes(SourceTextureFormat format, unsigned width, 
 }
 
 namespace {
+// PICA stores ETC blocks in little-endian byte order. The two endpoint
+// colors approximate the lowest mip at distances where its detail is subpixel.
+uint32 distant_etc_color(const uint8* blocks,std::size_t bytes){
+    unsigned sum[3]={};
+    for(std::size_t i=0;i<bytes;i+=8){
+        for(unsigned c=0;c<3;++c){
+            const unsigned value=blocks[i+7-c];
+            if(blocks[i+4]&2){
+                const int first=int(value>>3),delta=int(value&7);
+                const int second=std::clamp(first+(delta>=4?delta-8:delta),0,31);
+                sum[c]+=unsigned(((first<<3)|(first>>2))+((second<<3)|(second>>2)));
+            }else sum[c]+=17*((value>>4)+(value&15));
+        }
+    }
+    const unsigned count=unsigned(bytes/4);
+    return 0xff000000u | (sum[0]/count)<<16 | (sum[1]/count)<<8 | (sum[2]/count);
+}
+
 bool ReadGroup(ResourceReader& reader, std::vector<TextureCacheEntry>& out, std::size_t base) {
     const auto count = reader.U32();
     if (!count || !reader.Count(count, 20, 16384)) return false;
@@ -136,17 +159,20 @@ bool ReadGroup(ResourceReader& reader, std::vector<TextureCacheEntry>& out, std:
         entry.format = SourceTextureFormat(format);
         auto width = entry.width;
         auto height = entry.height;
-        std::size_t bytes = 0;
+        std::size_t bytes = 0,last_bytes=0;
         for (unsigned level = 0; level < entry.levels; ++level, width /= 2, height /= 2) {
             if (width < 8 || height < 8) return false;
-            bytes += NativeTextureLevelBytes(entry.format, width, height);
+            last_bytes=NativeTextureLevelBytes(entry.format,width,height);
+            bytes+=last_bytes;
         }
         if (bytes != entry.bytes) return false;
-        while (bytes) {
-            const auto chunk = std::min<std::size_t>(bytes, 4096);
-            if (!reader.Skip(chunk)) return false;
-            bytes -= chunk;
-        }
+        if(base && source_application_os_is_old_3ds() && entry.format==SOURCE_TEXTURE_ETC1 &&
+           entry.width==entry.sample_width && entry.height==entry.sample_height && last_bytes<=2048){
+            if(!reader.Skip(bytes-last_bytes))return false;
+            const auto* mip=reader.Bytes(last_bytes);
+            if(!mip)return false;
+            entry.distant_color=distant_etc_color(mip,last_bytes);
+        }else if(!reader.Skip(bytes))return false;
         parsed.push_back(entry);
     }
     if (!reader.Ok() || reader.Remaining()) return false;
@@ -181,6 +207,7 @@ TextureCacheFile FindDiskTextureCacheGroup(uint32 checksum, uint32 size, Texture
         const bool valid = SeekCache(file, record->offset) &&
             ReadGroup(reader, entries, record->offset) && input.crc == record->payload_crc;
         if (valid) return cache;
+        Log("TEXTURE_CACHE_INVALID file=%s stage=group key=%08x", CachePath(cache), checksum);
         DropCacheHandle(cache);
         entries.clear();
     }

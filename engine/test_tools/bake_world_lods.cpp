@@ -85,9 +85,53 @@ void LockBoundaryCorners(const std::vector<Vertex>& vertices, const std::vector<
     }
 }
 
+// Cutoff 1 is also used on solid scenery. Evaluate the source texture once
+// per dictionary entry, including mips that the handheld may select at a distance.
+class TextureOpacity {
+    std::vector<TextureAsset> textures;
+    std::map<uint32, const TextureAsset*> by_id;
+    std::map<uint32, bool> cache;
+public:
+    void Load(File::PreFile& pre, const std::string& level) {
+        const auto name = "levels/" + level + "/" + level + ".tex.xbx";
+        if (!pre.GetContainedFile(name.c_str())) return;
+        pre.Reset();
+        auto bytes = std::make_shared<ResourceBytes>(pre.GetFileSize());
+        const bool read = pre.Read(bytes->data(), bytes->size()) == int(bytes->size());
+        pre.Close(false);
+        if (read && ReadTextureDictionary(bytes, textures))
+            for (const auto& texture : textures) by_id.emplace(texture.checksum, &texture);
+    }
+
+    bool IsOpaque(uint32 id) {
+        if (!id) return true; // An untextured material uses vertex alpha only.
+        if (auto it = cache.find(id); it != cache.end()) return it->second;
+        const auto it = by_id.find(id);
+        bool opaque = it != by_id.end() && !it->second->levels.empty();
+        ResourceBytes rgba;
+        for (unsigned level = 0; opaque && level < it->second->levels.size(); ++level) {
+            opaque = DecodeTextureLevel(*it->second, level, rgba) && !rgba.empty();
+            for (std::size_t i = 3; opaque && i < rgba.size(); i += 4)
+                opaque = rgba[i] == 255;
+        }
+        cache.emplace(id, opaque);
+        return opaque;
+    }
+};
+
 std::vector<uint16> Simplify(const SectorAsset& sector, const MaterialAsset& material,
-                             const RenderTopology& topology, bool opaque_surfaces, float& error) {
+                             const RenderTopology& topology, bool opaque_surfaces, bool old_surfaces, TextureOpacity& opacity, float& error) {
     if (topology.triangles.size() < 18 || topology.triangles.size() > 60000) return {};
+    // Preserve boundaries and seams, but put less weight on interior UV
+    // and color variation for distant opaque meshes on the smaller target.
+    const auto& pass = material.passes.front();
+    const bool solid_pass = (pass.alpha & 0xffffff) == 0;
+    const bool solid_cutoff = old_surfaces && solid_pass && material.alpha_cutoff == 1 &&
+        !material.sorted && opacity.IsOpaque(pass.texture) &&
+        ((pass.flags & (1u << 12)) || std::all_of(topology.vertices.begin(), topology.vertices.end(),
+            [&](uint16 index) { return (sector.Color(index) >> 24) >= 128; }));
+    const bool opaque = solid_pass && (material.alpha_cutoff == 0 || solid_cutoff);
+    const bool flat = old_surfaces && opaque && !material.sorted && !(pass.flags & 8);
     const bool has_uv = material.passes[0].texture && sector.uv_sets;
     std::vector<Vertex> vertices;
     std::vector<uint16> source_indices;
@@ -116,7 +160,6 @@ std::vector<uint16> Simplify(const SectorAsset& sector, const MaterialAsset& mat
         if (a != b && b != c && a != c) indices.insert(indices.end(), {a, b, c});
     }
     if (indices.size() < 6) return {};
-    const bool opaque = (material.passes[0].alpha & 0xffffff) == 0 && !material.alpha_cutoff;
     if ((!opaque_surfaces || !opaque) && !MostlyUpright(vertices, indices)) return {};
 
     // Preserve all UV and color seams, including a seam represented by
@@ -134,14 +177,23 @@ std::vector<uint16> Simplify(const SectorAsset& sector, const MaterialAsset& mat
 
     constexpr float weights[]{1.5f, 1.5f, .25f, .25f, .25f, 1.f};
     std::vector<unsigned> simplified(indices.size());
-    const auto target = std::max<std::size_t>(2, indices.size() / (opaque_surfaces && opaque ? 9 : 6)) * 3;
-    const auto count = meshopt_simplifyWithAttributes(simplified.data(), indices.data(),
-        indices.size(), vertices[0].position.data(), vertices.size(), sizeof(Vertex),
-        vertices[0].attributes.data(), sizeof(Vertex), weights, std::size(weights),
-        locks.data(), target, StaticLodMaxError,
-        meshopt_SimplifyErrorAbsolute, &error);
-    if (count < 3 || count > topology.triangles.size() * 4 / 5 ||
-        !std::isfinite(error) || error > StaticLodMaxError) return {};
+    constexpr float distant_weights[]{.08f,.08f,.05f,.05f,.05f,1.f};
+    const auto target = std::max<std::size_t>(2, indices.size() / (flat ? 15 : opaque_surfaces && opaque ? 9 : 6)) * 3;
+    auto run = [&](const float* importance, std::size_t target_count) {
+        return meshopt_simplifyWithAttributes(simplified.data(), indices.data(),
+            indices.size(), vertices[0].position.data(), vertices.size(), sizeof(Vertex),
+            vertices[0].attributes.data(), sizeof(Vertex), importance, std::size(weights),
+            locks.data(), target_count, StaticLodMaxError, meshopt_SimplifyErrorAbsolute, &error);
+    };
+    auto acceptable = [&](std::size_t count) {
+        return count >= 3 && count <= topology.triangles.size() * 4 / 5 &&
+               std::isfinite(error) && error <= StaticLodMaxError;
+    };
+    auto count = run(flat ? distant_weights : weights, target);
+    // A more aggressive target can lose a previously valid upright LOD.
+    if (!acceptable(count) && solid_cutoff && MostlyUpright(vertices, indices))
+        count = run(weights, std::max<std::size_t>(2, indices.size() / 6) * 3);
+    if (!acceptable(count)) return {};
     std::vector<uint16> result;
     result.reserve(count);
     for (std::size_t i = 0; i < count; ++i) result.push_back(source_indices[simplified[i]]);
@@ -152,7 +204,7 @@ void AppendWord(ResourceBytes& bytes, uint32 value) {
     for (unsigned shift = 0; shift < 32; shift += 8) bytes.push_back(uint8(value >> shift));
 }
 
-bool Bake(File::PreFile& pre, const std::string& level, const fs::path& output, bool opaque_surfaces) {
+bool Bake(File::PreFile& pre, const std::string& level, const fs::path& output, bool opaque_surfaces, bool old_surfaces) {
     const auto name = "levels/" + level + "/" + level + ".scn.xbx";
     if (!pre.GetContainedFile(name.c_str())) return true;
     pre.Reset();
@@ -164,6 +216,8 @@ bool Bake(File::PreFile& pre, const std::string& level, const fs::path& output, 
     std::map<uint32, const MaterialAsset*> materials;
     for (const auto& material : asset.materials) materials.emplace(material.checksum, &material);
 
+    TextureOpacity opacity;
+    if (old_surfaces) opacity.Load(pre, level);
     ResourceBytes entries;
     unsigned count = 0, blended = 0;
     std::size_t before = 0, after = 0;
@@ -176,7 +230,7 @@ bool Bake(File::PreFile& pre, const std::string& level, const fs::path& output, 
             RenderTopology topology;
             if (!BuildRenderTopology(asset, si, mi, 0, nullptr, 0, topology)) return false;
             float error = 0;
-            auto reduced = Simplify(sector, material, topology, opaque_surfaces, error);
+            auto reduced = Simplify(sector, material, topology, opaque_surfaces, old_surfaces, opacity, error);
             if (reduced.empty()) continue;
             ++count;
             blended += (material.passes[0].alpha & 0xffffff) != 0;
@@ -213,7 +267,7 @@ bool Bake(File::PreFile& pre, const std::string& level, const fs::path& output, 
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: source_bake_world_lods RETAIL_DATA NEW_LOD_DIRECTORY [--opaque-surfaces] [level ...]\n");
+        std::fprintf(stderr, "usage: source_bake_world_lods RETAIL_DATA NEW_LOD_DIRECTORY [--opaque-surfaces|--old-surfaces] [level ...]\n");
         return 2;
     }
     Mem::Manager::sSetUp();
@@ -232,14 +286,15 @@ int main(int argc, char** argv) {
                 levels.push_back(name.substr(0, name.size()-7));
         }
         std::sort(levels.begin(), levels.end());
-        const bool opaque_surfaces = argc > 3 && std::string_view(argv[3]) == "--opaque-surfaces";
+        const bool old_surfaces=argc>3 && std::string_view(argv[3])=="--old-surfaces";
+        const bool opaque_surfaces = old_surfaces || (argc > 3 && std::string_view(argv[3]) == "--opaque-surfaces");
         const int first_level = opaque_surfaces ? 4 : 3;
         if (argc > first_level) levels.assign(argv+first_level, argv+argc);
         for (const auto& level : levels) {
             auto* bytes = static_cast<uint8*>(File::LoadAllocNoPre(("pre/" + level + "scn.pre").c_str()));
             if (!bytes) { ok = false; break; }
             File::PreFile pre(bytes);
-            if (!Bake(pre, level, output, opaque_surfaces)) {
+            if (!Bake(pre, level, output, opaque_surfaces, old_surfaces)) {
                 std::fprintf(stderr, "Cannot bake scene %s\n", level.c_str());
                 ok = false;
                 break;

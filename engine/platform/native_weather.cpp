@@ -1,4 +1,5 @@
 #include <source_port/native_weather.h>
+#include <source_port/launch_paths.h>
 #include <source_port/render_options.h>
 #include <gfx/nx.h>
 #include <gfx/nxtexman.h>
@@ -24,7 +25,7 @@ SourcePort::WeatherParameters CNativeWeather::parameters()const{
 void CNativeWeather::plat_update_grid(){
     m_system_active=false;
     m_active_drops=0;
-    if(!source_render_options()->atmospheric_effects)return;
+    if(!source_render_options()->atmospheric_effects || SourcePort::OldFreeSkateAmbientDisabled())return;
     Mth::Line ignored;auto* sectors=CEngine::sGetNearestSuperSectorManager(ignored);if(!sectors)return;
     field_.Build(*sectors->GetWorldBBox(),roof);auto* dict=CTexDictManager::sp_particle_tex_dict;Dbg_Assert(dict);
     splash_=dynamic_cast<CNativeTexture*>(dict->GetTexture(0x45c7eb0f));snow_=dynamic_cast<CNativeTexture*>(dict->GetTexture(0xc97c5a4c));m_system_active=field_.Ready();

@@ -2,6 +2,7 @@
 #include <source_port/resource_reader.h>
 #include <array>
 #include <vector>
+#include <variant>
 #include <memory>
 #include <gfx/nxhierarchy.h>
 namespace SourcePort {
@@ -39,6 +40,7 @@ struct MaterialPass {
 };
 struct MaterialAsset {
     uint32 checksum=0,name=0,alpha_cutoff=0;bool sorted=false,single_sided=false,no_backface=false,grass=false;
+    bool frozen_scenery=false;
     float draw_order=0,grass_height=0;int z_bias=0,grass_layers=0;std::array<float,4> specular{};
     std::vector<MaterialPass> passes;std::vector<ColorSequence> color_wibble;
 };
@@ -57,23 +59,54 @@ struct StaticAssetVertex {
     uint32 color = 0xffffffff;
 };
 static_assert(sizeof(StaticAssetVertex) == 16);
+// 3DS level coordinates on the original 1/16-unit grid. Two color words
+// keep all four authored bytes without giving each vertex 4-byte alignment.
+struct GridVertex {
+    std::array<uint16_t, 3> delta;
+    uint16_t color_low, color_high;
+};
+static_assert(sizeof(GridVertex) == 10);
+struct GridVertices {
+    std::array<int32_t, 3> origin;
+    std::vector<GridVertex> values;
+};
+enum class SceneVertexStorage { Full, Compact, ExactGrid };
 struct WideUV { uint32 index; float value; };
 struct SectorAsset {
     uint32 checksum=0,flags=0;int bone=-1;std::array<float,6> box{};std::array<float,4> sphere{};
+    bool scenery_effect=false;
     uint32 billboard_type=0;std::array<float,9> billboard{};unsigned stride=0,uv_sets=0;
     std::vector<AssetVertex> vertices;
     std::vector<std::array<float,2>> uv;
     std::vector<MeshAsset> meshes;
-    std::vector<StaticAssetVertex> static_vertices;
+    std::variant<std::vector<StaticAssetVertex>, GridVertices> static_vertices;
     std::vector<std::array<float, 3>> static_normals;
     std::vector<uint8> static_wibble;
     std::vector<int16_t> packed_uv;
     std::vector<WideUV> wide_uv;
-    std::size_t VertexCount() const { return vertices.empty() ? static_vertices.size() : vertices.size(); }
-    const std::array<float, 3>& Position(std::size_t index) const {
-        return vertices.empty() ? static_vertices[index].position : vertices[index].position;
+    void PackStaticPositions();
+    std::size_t VertexCount() const {
+        if (!vertices.empty()) return vertices.size();
+        if (const auto* grid = std::get_if<GridVertices>(&static_vertices)) return grid->values.size();
+        return std::get<std::vector<StaticAssetVertex>>(static_vertices).size();
     }
-    uint32 Color(std::size_t i) const { return vertices.empty() ? static_vertices[i].color : vertices[i].color; }
+    std::array<float, 3> Position(std::size_t index) const {
+        if (!vertices.empty()) return vertices[index].position;
+        if (const auto* grid = std::get_if<GridVertices>(&static_vertices)) {
+            const auto& d = grid->values[index].delta;
+            return {(grid->origin[0] + d[0]) * .0625f, (grid->origin[1] + d[1]) * .0625f,
+                    (grid->origin[2] + d[2]) * .0625f};
+        }
+        return std::get<std::vector<StaticAssetVertex>>(static_vertices)[index].position;
+    }
+    uint32 Color(std::size_t index) const {
+        if (!vertices.empty()) return vertices[index].color;
+        if (const auto* grid = std::get_if<GridVertices>(&static_vertices)) {
+            const auto& v = grid->values[index];
+            return uint32(v.color_low) | (uint32(v.color_high) << 16);
+        }
+        return std::get<std::vector<StaticAssetVertex>>(static_vertices)[index].color;
+    }
     uint8 ColorWibble(std::size_t i) const {
         return vertices.empty() ? (static_wibble.empty() ? 0 : static_wibble[i]) : vertices[i].color_wibble;
     }
@@ -89,7 +122,7 @@ struct SceneAsset {
     bool pedestrian_skin = false;
 };
 bool ReadScene(std::shared_ptr<const ResourceBytes>,SceneAsset&,ResourceError* error=nullptr);
-bool ReadScene(const void*, std::size_t, SceneAsset&, ResourceError* error=nullptr, bool compact_static=false);
+bool ReadScene(const void*, std::size_t, SceneAsset&, ResourceError* error=nullptr, SceneVertexStorage storage=SceneVertexStorage::Full);
 struct SceneSignature { std::size_t size; uint32 checksum; };
-bool ReadSceneResource(const char*, SceneAsset&, ResourceError* error=nullptr, SceneSignature* signature=nullptr, bool compact_static=false);
+bool ReadSceneResource(const char*, SceneAsset&, ResourceError* error=nullptr, SceneSignature* signature=nullptr, SceneVertexStorage storage=SceneVertexStorage::Full);
 }

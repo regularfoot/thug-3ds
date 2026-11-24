@@ -31,6 +31,7 @@ std::vector<uint32> ordinary_bits,visible_bits;
 struct WorldPartitionCell {
     Mth::Vector center,half;
     std::size_t first,last,left=0,right=0;
+    bool range_limited=false;
 };
 std::vector<WorldPartitionEntry> partition_entries;
 std::vector<WorldPartitionCell> partition_cells;
@@ -275,7 +276,11 @@ static std::size_t BuildWorldPartitionCell(std::size_t first,std::size_t last){
     auto half=(bounds.GetMax()-bounds.GetMin())*.5f;
     const auto node=partition_cells.size();
     partition_cells.push_back({bounds.GetMin()+half,half,first,last});
-    if(last-first<=8)return node;
+    if(last-first<=8){
+        partition_cells[node].range_limited=std::all_of(partition_entries.begin()+first,partition_entries.begin()+last,
+            [](const auto& entry){return entry.geom->CanLimitWorldRange();});
+        return node;
+    }
 
     const unsigned axis=half[X]>=half[Z]?X:Z;
     const auto middle=first+(last-first)/2;
@@ -285,6 +290,7 @@ static std::size_t BuildWorldPartitionCell(std::size_t first,std::size_t last){
     const auto right=BuildWorldPartitionCell(middle,last);
     partition_cells[node].left=left;
     partition_cells[node].right=right;
+    partition_cells[node].range_limited=partition_cells[left].range_limited && partition_cells[right].range_limited;
     return node;
 }
 static bool PrepareWorldPartition(){
@@ -323,6 +329,13 @@ static bool ClassifyWorldBox(const WorldView& view,const Mth::Vector& center,con
 }
 static void MarkVisibleWorldCells(const WorldView& view,std::size_t node,unsigned planes,unsigned occluders=~0u){
     const auto& cell=partition_cells[node];
+    if(view.static_world_radius>0 && cell.range_limited){
+        const float x=std::max(0.f,std::abs(cell.center[X]-view.position[X])-cell.half[X]);
+        const float z=std::max(0.f,std::abs(cell.center[Z]-view.position[Z])-cell.half[Z]);
+        // A little slack covers center/extent rounding relative to sector bounds.
+        const float radius=view.static_world_radius+std::abs(view.stereo_eye_shift)+1.f;
+        if(x*x+z*z>radius*radius)return;
+    }
     if(!ClassifyWorldBox(view,cell.center,cell.half,planes))return;
     // Reject a whole branch only if one original occluder covers the
     // complete AABB from both eyes. Other branches keep per-mesh testing.
@@ -532,6 +545,22 @@ void SetWorldMaterialState(WorldDrawState& state,const MaterialAsset& material,u
 namespace Nx {
 CNativeGeom::CNativeGeom(){controller();transform_.Ident();scale_.Set(1,1,1,1);sphere_.Set(0,0,0,0);model_cull_sphere_.Set(0,0,0,0);color_=Image::RGBA(128,128,128,128);SourcePort::RootHeapScope registry;geoms.push_back(this);partition_dirty=true;}
 CNativeGeom::~CNativeGeom(){controller();LeaveStaticWorldPartition();auto at=std::find(geoms.begin(),geoms.end(),this);Dbg_Assert(at!=geoms.end());geoms.erase(at);partition_dirty=true;if(mp_orig_render_colors)Mem::Free(mp_orig_render_colors);mp_orig_render_colors=nullptr;}
+void CNativeGeom::SetStaticWorldMaterials(std::shared_ptr<const SourcePort::StaticWorldMaterials> materials){
+    if(partitioned_ && bool(static_materials_)!=bool(materials))partition_dirty=true;
+    static_materials_=std::move(materials);
+    city_prop_extent_=-1;
+}
+static bool distant_landmark(const Mth::CBBox& box){
+    const auto span=box.GetMax()-box.GetMin();
+    return span[Y]>=400.f && std::max(span[X],span[Z])>=2000.f;
+}
+bool CNativeGeom::CanLimitWorldRange() const{
+    if(!partitioned_ || !static_materials_ || distant_landmark(box_))return false;
+    // The sector distance test uses source coordinates only for stationary world geometry.
+    static constexpr float identity[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+    return scale_[X]==1 && scale_[Y]==1 && scale_[Z]==1 &&
+           std::memcmp(&transform_[0][0],identity,sizeof identity)==0;
+}
 void CNativeGeom::EnableStaticWorldPartition(){
     if(partitioned_||!asset_||sky_||dictionary_only_||model_||billboard_||!BoneMatrices().empty())return;
     for(auto sector:sectors_){
@@ -780,6 +809,8 @@ float CNativeGeom::city_prop_extent()const{
 void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vector<SourcePort::WorldBatch>& out,bool snapshot,bool raw_colors,bool projection_receiver,unsigned frustum_mask)const{
     const auto& bones_=BoneMatrices();
     if(dictionary_only_||!asset_||(!snapshot&&(!active_||view.viewport>=32||!(visibility_&(1u<<view.viewport)))))return;
+    // Keep the sector registered for QB and collision, including after a script reactivates it.
+    if(sectors_.size()==1 && asset_->sectors[sectors_.front()].scenery_effect)return;
     if(world_sphere_dirty_){
         render_transform_=transform_;
         for(unsigned r=0;r<3;++r)render_transform_[r]*=scale_[r];
@@ -813,6 +844,20 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
         }else if(!SourcePort::SphereVisible(view,bound))return;
     }
     const bool performance=view.performance&&!snapshot;
+    // Reject distant level sectors before expanding their triangle strips or
+    // uploading textures. Test their nearest edge so long ramps remain visible.
+    if (performance && view.static_world_radius > 0 && static_materials_ && !sky_ &&
+        !model_ && !projection_receiver && render_transform_identity_ && bones_.empty() && !(view.preserve_arena_landmarks&&distant_landmark(box_))) {
+        const auto& low=box_.GetMin();
+        const auto& high=box_.GetMax();
+        const float dx=std::max({0.f,low[X]-view.position[X],view.position[X]-high[X]});
+        const float dz=std::max({0.f,low[Z]-view.position[Z],view.position[Z]-high[Z]});
+        const float radius=view.static_world_radius+std::abs(view.stereo_eye_shift);
+        if(dx*dx+dz*dz>radius*radius) {
+            if(view.detail_stats)++view.detail_stats->distant_prop_sectors;
+            return;
+        }
+    }
     if(performance&&view.cull_static_meshes&&view.city_prop_radius>0&&!dictionary_only_&&static_materials_&&render_transform_identity_&&
        !model_&&bones_.empty()&&!raw_colors&&!projection_receiver&&m_cloned==vORIGINAL&&
        edited_.empty()&&render_colors_.empty()&&overrides_.empty()&&!hide_mask_&&!custom_wibble_&&!explicit_uv_){
@@ -883,7 +928,7 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
             if(performance){unsigned lod=!local_player&&distance_squared>1500.f*1500.f?mesh.lods.size()-1:0;cache=&render_mesh(meshes[mi],s,mi,lod);material=&asset_->materials[cache->material];}
             else{Dbg_Assert(SourcePort::MeshTriangles(*asset_,s,mi,0,&cas_,hide_mask_,original_triangles));
                 for(const auto& m:asset_->materials)if(m.checksum==mesh.material){material=&m;break;}}
-            if(local_player&&view.city_stereo_fast&&(source->flags&16)&&!bones_.empty()&&cache&&source==&original){
+            if(local_player&&(view.city_stereo_fast || view.old_player_lod)&&(source->flags&16)&&!bones_.empty()&&cache&&source==&original){
                 auto& reduced=meshes[mi].distant;
                 if(!reduced){SourcePort::RootHeapScope storage;reduced=std::make_unique<RenderMeshCache>();}
                 cache=&render_mesh(*reduced,s,mi,0,false,true);
@@ -977,7 +1022,7 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
             bool billboard=source->flags&0x00800000;
             bool need_normals=!performance||billboard;
             bool immutable=performance&&!overlay_passes&&view.retain_static&&!model_&&bones_.empty()&&!billboard&&!raw_colors&&!projection_receiver&&!custom_wibble_
-                &&material->color_wibble.empty();
+                &&(material->frozen_scenery||material->color_wibble.empty());
             if(immutable)immutable=!(material->passes[base_pass].flags&(1|2|(1<<11)));
             if(original_scenery&&immutable&&view.backface_static&&bounds_view->frustum_positive_winding&&
                SourcePort::WorldMaterialCullsBackfaces(*material,material->passes[blend_pass].alpha&0xffffff)){
@@ -994,7 +1039,24 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
                     continue;
                 }
             }
-            if(immutable&&cache->revision==render_revision_){if(auto saved=cache->retained.lock()){
+            uint32 distant_color=0;
+            if(view.old_player_lod && original_scenery && immutable && !material->sorted &&
+               material->alpha_cutoff<=1 && material->passes.size()==1 && !material->grass &&
+               !(material->passes.front().alpha&0xffffff) && overrides_.empty() && cache->bounds_revision==render_revision_){
+                const auto& half=cache->box_half_size;
+                const auto& pass=material->passes.front();
+                const bool small=std::max({half[X],half[Y],half[Z]})<80.f;
+                // Use the same choice for both eyes. Keep close props textured
+                // and allow a margin when crossing the distance threshold.
+                auto last=cache->retained.lock();
+                const float limit=last && last->distant_color?750.f:950.f;
+                if(dictionary_ && pass.texture && (cache!=full_cache ||
+                    (small && (cache->box_center-view.position).LengthSqr()>limit*limit))){
+                    if(auto* tex=SourcePort::world_texture(view,*dictionary_,pass.texture))
+                        distant_color=tex->DistantColor();
+                }
+            }
+            if(immutable&&cache->revision==render_revision_){if(auto saved=cache->retained.lock();saved && saved->distant_color==distant_color){
                 if(view.detail_stats)++view.detail_stats->retained_hits;
                 const auto group=out.size();
                 auto prepare_batch=[&](SourcePort::WorldBatch& batch){
@@ -1002,7 +1064,8 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
                     // A material survives a dictionary edit independently of its sampler.
                     batch.texture=nullptr;
                     const auto texture=material->passes[base_pass].texture;
-                    if(texture){
+                    if(texture && !saved->texture && view.detail_stats)++view.detail_stats->flat_meshes;
+                    if(texture && saved->texture){
                         Dbg_Assert(dictionary_);
                         batch.texture=SourcePort::world_texture(view,*dictionary_,texture);
                         Dbg_Assert(batch.texture);
@@ -1064,6 +1127,7 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
             if(custom_wibble_){custom=*material;for(auto& p:custom.passes){p.flags|=1;p.uv_wibble=wibble_;}current=&custom;}
             bool animated=!performance||!current->color_wibble.empty()||custom_wibble_;
             if(performance)animated|=bool(current->passes[base_pass].flags&(1|2|(1<<11)));
+            if(current->frozen_scenery)animated=false;
             SourcePort::MaterialFrame animation;if(animated)Dbg_Assert(SourcePort::EvaluateMaterial(*current,time,time,animation));
             std::size_t group=out.size();
             for(unsigned pi=performance?base_pass:0;pi<material->passes.size();++pi){const auto& pass=material->passes[pi];SourcePort::WorldBatch batch;
@@ -1120,6 +1184,7 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
                 }else batch.vertices.reserve(entries);
                 if(shard_lighting)batch.shard_lighting.reserve(triangles.size());
                 auto texture=animated?animation.passes[pi].texture:pass.texture;if(texture&&!projection_receiver){Dbg_Assert(dictionary_);batch.texture=SourcePort::world_texture(view,*dictionary_,texture);Dbg_MsgAssert(batch.texture,("Original material %08x missing texture %08x",material->checksum,texture));}
+                if(distant_color){batch.texture=nullptr;if(view.detail_stats)++view.detail_stats->flat_meshes;}
                 auto override=overrides_.find({material->checksum,pi});const Override* change=override==overrides_.end()?nullptr:&override->second;
                 const bool attributes=performance&&!overlay&&(model_||!bones_.empty())&&!billboard&&!animated&&!(pass.flags&8)&&!raw_colors&&!projection_receiver;
                 const bool reuse_attributes=attributes&&cache->attributes_revision==attributes_revision_&&cache->attributes.size()==cache->topology.vertices.size();
@@ -1173,8 +1238,10 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
                             }}}
                     if(change&&change->uv_set){auto uv=transformed(Mth::Vector(u,v,0,1),change->uv);u=uv[0];v=uv[1];}
                     else{auto offset=explicit_uv_?uv_offset_:(animated?animation.passes[pi].uv_offset:std::array<float,2>{0,0});u+=offset[0];v+=offset[1];}
-                    Image::RGBA vc=unpacked(diffuse?(*diffuse)[vi]:source->Color(vi));auto w=source->ColorWibble(vi);if(w){Dbg_Assert(w<=animation.vertex_colors.size());auto a=animation.vertex_colors[w-1];vc=Image::RGBA(a[0],a[1],a[2],a[3]);}
+                    Image::RGBA vc=unpacked(diffuse?(*diffuse)[vi]:source->Color(vi));auto w=source->ColorWibble(vi);if(w && current->frozen_scenery && w<=current->color_wibble.size()){vc=unpacked(current->color_wibble[w-1].keys.front().rgba);}
+                    else if(w){Dbg_Assert(w<=animation.vertex_colors.size());auto a=animation.vertex_colors[w-1];vc=Image::RGBA(a[0],a[1],a[2],a[3]);}
                     auto rgb=pass.color;if(color_set_)rgb={color_.r/255.f,color_.g/255.f,color_.b/255.f};if(change&&change->color_set)rgb={change->color.r/255.f,change->color.g/255.f,change->color.b/255.f};
+                    if(distant_color){rgb[0]*=((distant_color>>16)&255)/255.f;rgb[1]*=((distant_color>>8)&255)/255.f;rgb[2]*=(distant_color&255)/255.f;}
                     auto light=(!performance&&model_&&(source->flags&4))?SourcePort::LightNormal(*lighting,n):std::array<float,3>{1,1,1};
                     if(raw_colors){rgb={1,1,1};light={1,1,1};}
                     if(shard_lighting)batch.shard_lighting.push_back({n,{vc.r*rgb[0],vc.g*rgb[1],vc.b*rgb[2]}});
@@ -1242,6 +1309,7 @@ void CNativeGeom::Gather(const SourcePort::WorldView& view,uint32 time,std::vect
                     if(!render_owner_)render_owner_=std::make_shared<const uint8>(0);
                     auto saved=std::make_shared<SourcePort::StaticWorldMesh>();
                     static_cast<SourcePort::WorldDrawState&>(*saved)=static_cast<const SourcePort::WorldDrawState&>(batch);
+                    saved->distant_color=distant_color;
                     saved->vertices=std::move(batch.vertices);saved->indices=batch.indices;saved->owner=render_owner_;saved->serial=++static_mesh_serial;
                     if(view.prepare_source_strips && original_scenery && cache==full_cache && index_static &&
                        batch.opaque && batch.depth_write && !batch.pass && !batch.environment && !batch.z_bias &&

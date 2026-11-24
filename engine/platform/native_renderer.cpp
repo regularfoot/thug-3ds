@@ -455,6 +455,7 @@ struct FrameProfile {
             SourcePort::Log("LOCAL_SKATER_DRAW n=%u parts=%u triangles=%u arrays=%u",frame,detail.local_parts,detail.local_triangles,detail.local_array_parts);
         if(occluded_meshes)SourcePort::Log("OCCLUSION n=%u meshes=%u triangles=%u",frame,occluded_meshes,occluded_triangles);
         if(detail.meshes)SourcePort::Log("DISTANT_DETAIL n=%u meshes=%u triangles=%u",frame,detail.meshes,detail.triangles);
+        if(detail.flat_meshes)SourcePort::Log("WORLD_FLAT n=%u opaque_meshes=%u",frame,detail.flat_meshes);
         if(detail.lod_meshes)SourcePort::Log("WORLD_LOD n=%u meshes=%u triangles_saved=%u",
             frame,detail.lod_meshes,detail.lod_triangles_saved);
         if(detail.partition_skipped)SourcePort::Log("WORLD_CELLS n=%u sectors_skipped=%u",frame,detail.partition_skipped);
@@ -497,6 +498,7 @@ struct FrameProfile {
 };
 struct Renderer {
     SourcePort::WorldMeshRetention mesh_retention{4*1024*1024};
+    SourcePort::WorldMeshRetention old_mesh_retention{768*1024};
     std::vector<std::unique_ptr<SourcePort::NativeWorldBatch>> worlds;
     std::vector<SourcePort::WorldBatch> batches;
     SourcePort::WorldOcclusion occlusion;
@@ -518,9 +520,16 @@ struct Renderer {
 #endif
 };
 std::unique_ptr<Renderer> renderer;
-SourcePort::WorldView viewport(Nx::CViewport* port,unsigned index){
+bool old_slam_city(){
+    if(!source_application_os_is_old_3ds())return false;
+    static const auto slam=Crc::GenerateCRCFromString("SJ");
+    return Nx::CEngine::sGetScene(slam)!=nullptr;
+}
+SourcePort::WorldView viewport(Nx::CViewport* port,unsigned index,bool full_arena){
     auto* camera=port->GetCamera();Dbg_Assert(camera);SourcePort::WorldView view;view.axes=camera->GetMatrix();view.position=camera->GetPos();view.hfov=camera->GetAdjustedHFOV();
     view.aspect=port->GetAspectRatio();view.near_clip=camera->GetNearClipPlane();view.far_clip=camera->GetFarClipPlane();view.viewport=index;
+    // Gameplay visibility and the raster view share the arena camera plane.
+    if(full_arena)view.far_clip=std::min(view.far_clip,12000.f);
     view.performance=source_render_options()->performance;
     view.x=std::clamp(int(port->GetOriginX()*400),0,399);view.y=std::clamp(int(port->GetOriginY()*240),0,239);
     view.width=std::clamp(int(port->GetWidth()*400),1,400-int(view.x));view.height=std::clamp(int(port->GetHeight()*240),1,240-int(view.y));
@@ -534,7 +543,7 @@ namespace SourcePort {
 bool WorldRendererReady(){Dbg_Assert(source_thread_is_controller());return renderer!=nullptr;}
 bool WorldRendererFrameOpen(){Dbg_Assert(source_thread_is_controller());return renderer&&renderer->frame;}
 void OpenWorldRenderer(){Dbg_Assert(source_thread_is_controller()&&GraphicsReady()&&!renderer);renderer=std::make_unique<Renderer>();
-    const auto* p=source_render_options();Log("RENDER performance=%d detailed_shadows=%d blur=%d secondary_passes=%d dynamic_lighting=%d texture_limit=%u world_size=400x240 ui_size=400x240 far_clip=original_camera",p->performance,p->detailed_shadows,p->motion_blur,p->secondary_passes,p->dynamic_lighting,p->texture_limit);}
+    const auto* p=source_render_options();Log("RENDER performance=%d detailed_shadows=%d blur=%d secondary_passes=%d dynamic_lighting=%d texture_limit=%u menu_size=400x240 ui_size=400x240 far_clip=original_camera",p->performance,p->detailed_shadows,p->motion_blur,p->secondary_passes,p->dynamic_lighting,p->texture_limit);}
 void ReleaseWorldSceneBuffers(){
     Dbg_Assert(source_thread_is_controller());
     if(!renderer)return;
@@ -542,6 +551,7 @@ void ReleaseWorldSceneBuffers(){
     // Their resident owners must survive until submit, but the optional CPU
     // retention must release its references before the next menu allocates.
     renderer->mesh_retention.Clear();
+    renderer->old_mesh_retention.Clear();
     if(renderer->frame&&!renderer->packets.empty())return;
     renderer->packets.clear();
     // Drop the batches and their owners before the next scene, but reuse the
@@ -586,12 +596,21 @@ void CEngine::s_plat_render_world(){
     bool local_arrays=false;
     bool strip_city=false, city_stereo=false;
     bool level_dense_walls=false, trial_dense_walls=false;
+    const bool old_arena=old_slam_city();
 #ifdef __3DS__
     bool vancouver=sGetScene(Crc::GenerateCRCFromString("VC"))!=nullptr;
     const auto options=renderer->route.Options(SourcePort::PerformanceRouteStep());
     renderer->watch_moscow=false;
     renderer->vancouver_early=false;
     renderer->benchmark_scene=0;
+    auto* game=Mdl::Skate::Instance();
+    const bool old_gameplay=count==1 && SourcePort::OldFreeSkateAmbientDisabled() && !game->GetGameMode()->IsFrontEnd();
+    if(old_gameplay){
+        static const auto moscow=Crc::GenerateCRCFromString("RU");
+        renderer->watch_moscow=sGetScene(moscow)!=nullptr || old_arena;
+        if(auto* skater=game->GetLocalSkater())
+            if(auto* component=GetModelComponentFromObject(skater))local_model=component->GetModel();
+    }
     if(source_application_os_is_new_3ds()){
         auto* skate=Mdl::Skate::Instance();
         if(!skate->GetGameMode()->IsFrontEnd()){
@@ -623,7 +642,7 @@ void CEngine::s_plat_render_world(){
         }
     }
 #endif
-    for(int i=0;i<count;++i){auto* port=CViewportManager::sGetActiveViewport(i);if(!port||!port->GetCamera())continue;auto view=viewport(port,i);if(i==0){renderer->profile.far_clip=view.far_clip;renderer->profile.camera_position=view.position;}
+    for(int i=0;i<count;++i){auto* port=CViewportManager::sGetActiveViewport(i);if(!port||!port->GetCamera())continue;auto view=viewport(port,i,old_arena);if(i==0){renderer->profile.far_clip=view.far_clip;renderer->profile.camera_position=view.position;}
 #ifdef __3DS__
         if(i==0 && renderer->route.running && renderer->route.turn){
             const auto step=SourcePort::PerformanceRouteStep();
@@ -666,8 +685,12 @@ void CEngine::s_plat_render_world(){
         const bool fast_city=city_stereo && SourcePort::UseOptimizedFramePath(SourcePort::PerformanceRouteStep());
         view.use_source_strips=city_stereo&&SourcePort::SourceStripsEnabled(SourcePort::PerformanceRouteStep());
         view.prepare_source_strips=strip_city&&(SourcePort::CompareSourceStrips()||SourcePort::SourceStripsEnabled(0));
-        source_graphics_fast_index_commands(fast_city);
-        view.refine_static_leaves=fast_city && SourcePort::CityCpuFast(SourcePort::PerformanceRouteStep());
+        bool old_skate=false;
+#ifdef __3DS__
+        old_skate=old_gameplay && local_model && view.performance;
+#endif
+        source_graphics_fast_index_commands(fast_city || old_skate);
+        view.refine_static_leaves=old_skate || (fast_city && SourcePort::CityCpuFast(SourcePort::PerformanceRouteStep()));
         view.keep_turn_buffers=fast_city && !local_arrays && SourcePort::KeepTurnBuffers();
         // Moscow uses the same CPU gather, with its existing GPU submission path.
         source_graphics_city_cpu(view.refine_static_leaves && !local_arrays,SourcePort::CompareCityCpu());
@@ -694,8 +717,12 @@ void CEngine::s_plat_render_world(){
 #endif
         if(view.performance){
             const bool old_console = source_application_os_is_old_3ds();
+#ifdef __3DS__
+            if (old_console && !Mdl::Skate::Instance()->GetGameMode()->IsFrontEnd())
+                view.static_world_radius=old_skate ? (vancouver ? 1450.f : 2100.f) : 2800.f;
+#endif
             if(!old_console&&SourcePort::CpuMeshCacheEnabled())view.mesh_retention=&renderer->mesh_retention;
-            view.direct_partition_gather=!old_console;
+            view.direct_partition_gather=!old_console || old_skate;
             // Reuse the proven two-eye conservative bounds in mono, too.
             // Full resolution and camera distance are unchanged.
             view.backface_static=true;
@@ -744,6 +771,36 @@ void CEngine::s_plat_render_world(){
             }
             view.gpu_skin=count==1&&(local_arrays||fast_city)&&SourcePort::GpuSkinningEnabled();
             view.test_player_skin=view.gpu_skin&&(fast_city||SourcePort::TestPlayerSkinning());
+            if(old_skate){
+                view.prune_occluders=true;
+                view.static_detail_pixels=12.f;
+                view.static_prop_radius=1300.f;
+                view.static_lod_pixels=4.f;
+                view.static_lod_min_distance=750.f;
+                view.reuse_pose_vertices=true;
+                view.gpu_skin=true;
+                view.test_player_skin=true;
+                view.old_player_lod=true;
+                view.local_arrays=sGetScene(Crc::GenerateCRCFromString("RU"))!=nullptr;
+            }
+            if(old_console && !game->GetGameMode()->IsFrontEnd()){
+                // Distances are to the nearest edge of a sector. Large silhouettes
+                // and sky survive independently of the prop budget.
+                switch(game->m_requested_level){
+                    case 0x09a44ec8: view.static_world_radius=3800.f; break; // Slam City Jam
+                    case 0x0d0f0229: view.static_world_radius=1550.f; break; // Vancouver
+                    case 0x7276630a: case 0x9db7727c: view.static_world_radius=1950.f; break; // NY, RU
+                    case 0x399bd4e8: view.static_world_radius=2000.f; break; // Hawaii
+                    case 0x8ca30405: case 0xa7ff414b: view.static_world_radius=2800.f; break; // School II, Hangar
+                    default: view.static_world_radius=2200.f; break;
+                }
+                view.preserve_arena_landmarks=old_arena;
+                view.static_detail_pixels=16.f;
+                view.static_prop_radius=old_arena?1500.f:1150.f;
+                view.static_lod_pixels=8.f;
+                view.static_lod_min_distance=450.f;
+                view.mesh_retention=&renderer->old_mesh_retention;
+            }
 #endif
             view.detail_stats=&renderer->profile.detail;
         }
@@ -755,13 +812,13 @@ void CEngine::s_plat_render_world(){
         renderer->profile.occluded_meshes+=occlusion.HiddenMeshes();
         renderer->profile.occluded_triangles+=occlusion.HiddenTriangles();
         renderer->profile.End(FrameProfile::Geometry);
-        std::vector<SourcePort::WorldBatch> splats;if(source_render_options()->detailed_shadows)SourcePort::GatherOriginalProjectedShadows(view,now,splats);{SourcePort::EffectRenderScope effects(view,splats);TextureSplatRender();}
+        std::vector<SourcePort::WorldBatch> splats;if(source_render_options()->detailed_shadows)SourcePort::GatherOriginalProjectedShadows(view,now,splats);if(!source_application_os_is_old_3ds()){SourcePort::EffectRenderScope effects(view,splats);TextureSplatRender();}
         renderer->profile.End(FrameProfile::Projection);
         auto transparent=std::find_if(batches.begin(),batches.end(),[](const auto& b){return !b.sky&&!b.opaque;});
         std::size_t sorted_prefix=material_sorted?std::size_t(transparent-batches.begin()):0;
         batches.insert(transparent,std::make_move_iterator(splats.begin()),std::make_move_iterator(splats.end()));
         const auto before_effects=batches.size();
-        if(!SourcePort::OmitTurnEffects(SourcePort::PerformanceRouteStep())){
+        if(!source_application_os_is_old_3ds() && !SourcePort::OmitTurnEffects(SourcePort::PerformanceRouteStep())){
             SourcePort::EffectRenderScope effects(view,batches);
             ShatterRender();
             const auto legacy_begin=batches.size();
@@ -824,7 +881,7 @@ void CEngine::s_plat_post_render(){
     float stereo=renderer->stereo;
     // The retail renderer clears ordinary frames even when a script asks
     // to disable color clearing. Its blur has a separate history buffer.
-    const uint32 clear_color=renderer->letterbox?0x000000ff:0x506070ff;
+    const uint32 clear_color=(renderer->letterbox || source_application_os_is_old_3ds())?0x000000ff:0x506070ff;
     std::size_t early=0;
 #ifdef __3DS__
     if(source_application_os_is_new_3ds()&&SourcePort::EarlyGeometryEnabled()&&(!renderer->watch_moscow||renderer->vancouver_early)&&
@@ -873,7 +930,15 @@ void CEngine::s_plat_post_render(){
 #endif
     if(early)result=source_graphics_submit_remaining(packets.data()+early,packets.size()-early,stereo);
 #ifdef __3DS__
-    else if(renderer->watch_moscow)result=source_graphics_submit_bounded(packets.data(),packets.size(),clear_color,stereo);
+    else if(source_application_os_is_old_3ds() && !Mdl::Skate::Instance()->GetGameMode()->IsFrontEnd()){
+        result=renderer->watch_moscow ? source_graphics_submit_bounded(packets.data(),packets.size(),clear_color,stereo)
+                                     : source_graphics_submit(packets.data(),packets.size(),clear_color,stereo);
+        static bool reported=false;
+        if(!reported && result==0){
+            SourcePort::Log("OLD_WORLD_TARGET width=400 height=240 hud=400x240");
+            reported=true;
+        }
+    }else if(renderer->watch_moscow)result=source_graphics_submit_bounded(packets.data(),packets.size(),clear_color,stereo);
 #endif
     else result=source_graphics_submit(packets.data(),packets.size(),clear_color,stereo);
     Dbg_MsgAssert(result==0,("Original frame GPU submit failed errno=%d",errno));
@@ -882,10 +947,12 @@ void CEngine::s_plat_post_render(){
 #endif
     renderer->profile.End(FrameProfile::Submit);
     renderer->frame=false;renderer->profile.Report(stereo);SourcePort::FinishNativeDiagnostics();
-    if(renderer->profile.frame<=4||renderer->profile.frame%32==0)
+    if(renderer->profile.frame<=4||renderer->profile.frame%32==0){
+        const auto& cache=source_application_os_is_old_3ds()?renderer->old_mesh_retention:renderer->mesh_retention;
         SourcePort::Log("CPU_MESH_CACHE n=%u bytes=%zu meshes=%zu hits=%u builds=%u",renderer->profile.frame,
-            renderer->mesh_retention.Bytes(),renderer->mesh_retention.Meshes(),
+            cache.Bytes(),cache.Meshes(),
             renderer->profile.detail.retained_hits,renderer->profile.detail.retained_builds);
+    }
     SourcePort::MarkDiagnosticFrame(renderer->profile.frame,SourcePort::DiagnosticFramePhase::Idle);
 #ifdef __3DS__
     auto& profile=renderer->profile;
@@ -924,6 +991,10 @@ void CEngine::s_plat_post_render(){
         // the game's SD card can block soundtrack reads for several seconds.
     }
     if (renderer->profile.frame == 1) SourcePort::BootPhase("first_engine_frame");
+    // Old 3DS has no stereo benchmark to flush the journal at the end of a
+    // test route. Publish a sample so the level-load check can observe play.
+    if (profile.frame % 128 == 0 && SourcePort::PerformanceRouteEnabled() && !source_application_os_is_new_3ds())
+        SourcePort::RequestDiagnosticCheckpoint();
     if (source_application_os_is_new_3ds() && renderer->profile.detail.local_parts &&
         !renderer->reported_local_frame){
         renderer->reported_local_frame=true;
@@ -941,6 +1012,7 @@ void CEngine::s_plat_set_color_buffer_clear(bool){
 }
 void CEngine::s_plat_set_letterbox(bool on){Dbg_Assert(renderer);renderer->letterbox=on;}
 bool CEngine::s_plat_is_visible(Mth::Vector& sphere,float radius){
-    for(int i=0;i<CViewportManager::sGetNumActiveViewports();++i){auto* port=CViewportManager::sGetActiveViewport(i);if(port&&port->GetCamera()){auto copy=sphere;copy[3]=radius;if(SourcePort::SphereVisible(viewport(port,i),copy))return true;}}return false;
+    const bool full_arena=old_slam_city();
+    for(int i=0;i<CViewportManager::sGetNumActiveViewports();++i){auto* port=CViewportManager::sGetActiveViewport(i);if(port&&port->GetCamera()){auto copy=sphere;copy[3]=radius;if(SourcePort::SphereVisible(viewport(port,i,full_arena),copy))return true;}}return false;
 }
 }

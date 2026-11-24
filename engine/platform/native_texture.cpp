@@ -13,11 +13,33 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <strings.h>
 namespace {
 uint64 texture_generation=1;
 unsigned pot(unsigned n){unsigned p=8;while(p<n&&p<1024)p*=2;return p;}
+bool compact_city_dictionary(const char* name) {
+    if (!name || !source_application_os_is_old_3ds()) return false;
+    std::string path(name);
+    std::replace(path.begin(), path.end(), '/', '\\');
+    if(strncasecmp(path.c_str(),"levels\\",7)!=0)return false;
+    const auto end=path.find('\\',7);
+    if(end==std::string::npos)return false;
+    const auto level=path.substr(7,end-7);
+    return strcasecmp(level.c_str(),"mainmenu") && !strcasecmp(path.c_str()+end+1,(level+".tex.xbx").c_str());
+}
 void controller(){Dbg_Assert(source_thread_is_controller());}
 uint8 byte(float v){return uint8(std::lround(std::clamp(v,0.f,255.f)));}
+std::size_t drop_base_mip(SourcePort::TextureCacheEntry& entry) {
+    const auto bytes=SourcePort::NativeTextureLevelBytes(entry.format,entry.width,entry.height);
+    entry.offset+=bytes;
+    entry.bytes-=bytes;
+    entry.width/=2;
+    entry.height/=2;
+    entry.sample_width=std::max(1u,entry.sample_width/2);
+    entry.sample_height=std::max(1u,entry.sample_height/2);
+    --entry.levels;
+    return bytes;
+}
 }
 namespace SourcePort {
 uint64 WorldTextureGeneration(){return texture_generation;}
@@ -78,10 +100,14 @@ std::size_t CNativeTexture::ReleaseUploadScratch(){
 }
 bool CNativeTexture::upload(){
     controller();if(gpu_)return true;if(!SourcePort::GraphicsReady())return false;
-    const unsigned limit=source_render_options()->texture_limit;
+    const auto configured_limit=source_render_options()->texture_limit;
+    const bool old_world=world_mips_ && source_application_os_is_old_3ds() && !target_ && !asset_.image && !asset_.font_palette;
+    const unsigned limit=old_world && configured_limit ? std::min(64u,configured_limit) : configured_limit;
     if ((compressed_group_ || disk_cache_ != SourcePort::TextureCacheFile::None) && !dirty_ && !target_) {
         SourcePort::ResourceBytes disk_payload;
         auto entry = compressed_entry_;
+        while(old_world && limit && entry.levels>1 && std::max(entry.width,entry.height)>limit)
+            drop_base_mip(entry);
         const auto* tiled = compressed_group_ ? compressed_group_->data() + entry.offset : nullptr;
         if (!tiled && SourcePort::ReadDiskTexturePayload(disk_cache_, entry, disk_payload)) tiled = disk_payload.data();
         while (tiled) {
@@ -96,14 +122,7 @@ bool CNativeTexture::upload(){
             }
             if (errno != ENOMEM) return false;
             if (!source_application_os_is_old_3ds() || entry.levels <= 1 || asset_.image || asset_.font_palette) break;
-            const auto base = SourcePort::NativeTextureLevelBytes(entry.format, entry.width, entry.height);
-            tiled += base;
-            entry.bytes -= base;
-            entry.width /= 2;
-            entry.height /= 2;
-            entry.sample_width = std::max(1u,entry.sample_width / 2);
-            entry.sample_height = std::max(1u,entry.sample_height / 2);
-            --entry.levels;
+            tiled += drop_base_mip(entry);
         }
     }
     if(world_mips_&&!dirty_&&!target_){
@@ -229,13 +248,13 @@ bool CNativeTexture::plat_combine_textures(CTexture* texture,bool){
         for(unsigned c=0;c<3;++c)pixels_[i+c]=byte(native->pixels_[i+c]*a+pixels_[i+c]*(1-a));pixels_[i+3]=byte(native->pixels_[i+3]+pixels_[i+3]*(1-a));}
     return changed();
 }
-bool CNativeTexDict::Load(std::shared_ptr<const SourcePort::ResourceBytes> bytes){
+bool CNativeTexDict::Load(std::shared_ptr<const SourcePort::ResourceBytes> bytes, const char* name){
     controller();
     std::vector<SourcePort::TextureAsset> assets;
     if (!SourcePort::ReadTextureDictionary(bytes,assets)) return false;
     m_file_size = bytes->size();
     dictionary_bytes_ = std::move(bytes);
-    return AddAssets(std::move(assets));
+    return AddAssets(std::move(assets), 0, name);
 }
 bool CNativeTexDict::LoadDisk(const char* name) {
     controller();
@@ -247,9 +266,9 @@ bool CNativeTexDict::LoadDisk(const char* name) {
     if (!SourcePort::ReadDiskTextureDictionary(disk, assets, checksum)) return false;
     m_file_size = disk->size;
     SourcePort::Log("TEXTURE_SOURCE mode=disk bytes=%u name=%s", unsigned(m_file_size), name);
-    return AddAssets(std::move(assets), checksum);
+    return AddAssets(std::move(assets), checksum, name);
 }
-bool CNativeTexDict::AddAssets(std::vector<SourcePort::TextureAsset> assets, uint32 disk_checksum) {
+bool CNativeTexDict::AddAssets(std::vector<SourcePort::TextureAsset> assets, uint32 disk_checksum, const char* name) {
     for(const auto& a:assets)if(mp_texture_lookup->GetItem(a.checksum))return false;
     for(auto& a:assets){auto* texture=new CNativeTexture;Dbg_Assert(texture->Assign(std::move(a)));mp_texture_lookup->PutItem(texture->GetChecksum(),texture);}
     if (source_render_options()->performance) {
@@ -268,13 +287,25 @@ bool CNativeTexDict::AddAssets(std::vector<SourcePort::TextureAsset> assets, uin
                 SourcePort::FindTextureCacheGroup(disk_checksum, m_file_size, SourcePort::TextureSource::Dictionary);
             if (group) SourcePort::ReadTextureCacheGroup(*group, entries);
         }
-        for (const auto& entry : entries) {
+        const bool compact_city = compact_city_dictionary(name);
+        unsigned reduced = 0;
+        std::size_t skipped_bytes = 0;
+        for (auto& entry : entries) {
             auto* texture = dynamic_cast<CNativeTexture*>(mp_texture_lookup->GetItem(entry.key));
             if (!texture) continue;
+            if (compact_city && entry.levels > 1 && std::max(entry.width, entry.height) > 64 &&
+                std::min(entry.width, entry.height) >= 16 && entry.width == entry.sample_width &&
+                entry.height == entry.sample_height &&
+                (entry.format == SOURCE_TEXTURE_ETC1 || entry.format == SOURCE_TEXTURE_ETC1A4)) {
+                skipped_bytes += drop_base_mip(entry);
+                ++reduced;
+            }
             texture->compressed_group_ = group;
             texture->disk_cache_ = cache;
             texture->compressed_entry_ = entry;
         }
+        if (compact_city)
+            SourcePort::Log("OLD_CITY_MIPS name=%s entries=%zu reduced=%u skipped_bytes=%zu", name, entries.size(), reduced, skipped_bytes);
         if (cache == SourcePort::TextureCacheFile::Venice)
             SourcePort::Log("VENICE_TEXTURE_CACHE entries=%zu", entries.size());
     }
@@ -346,7 +377,7 @@ CTexDict* CTexDictManager::s_plat_load_texture_dictionary(const char* name,bool,
     auto* dict=new CNativeTexDict(Crc::GenerateCRCFromString(name));
     if ((source_application_os_is_old_3ds() || source_application_os_is_new_3ds()) && dict->LoadDisk(name)) return dict;
     auto bytes=SourcePort::ReadRenderResource(name);
-    if(!bytes || !dict->Load(bytes)){delete dict;return nullptr;}return dict;
+    if(!bytes || !dict->Load(bytes,name)){delete dict;return nullptr;}return dict;
 }
 CTexDict* CTexDictManager::s_plat_load_texture_dictionary(uint32 key,uint32* data,int size,bool,uint32,bool,bool){
     if(!data||size<=0)return nullptr;const auto* start=reinterpret_cast<const uint8*>(data);

@@ -1,6 +1,7 @@
 // Original Xbox/NGC MiscFX algorithms over native vertex/material storage.
 // Original NxMiscFX owns tables, trail lifetime, pause, expiry and bounce math.
 #include <source_port/native_effects.h>
+#include <source_port/application_os.h>
 #include <source_port/native_particles.h>
 #include <source_port/native_renderer.h>
 #include <source_port/thread_os.h>
@@ -105,6 +106,7 @@ void plat_texture_splat_cleanup(){
     while(item){auto* next=p_splat_details_table->IterateNext();p_splat_details_table->FlushItem(key(item));delete static_cast<Splat*>(item);item=next;}splat_open=false;
 }
 void plat_shatter(CGeom* geom){
+    if(source_application_os_is_old_3ds())return;
     controller();Dbg_Assert(shatter_open&&p_shatter_details_table);auto* native=dynamic_cast<CNativeGeom*>(geom);Dbg_Assert(native);
     std::vector<SourcePort::WorldBatch> geometry;native->Gather(actual_view(),Tmr::GetTime(),geometry,true);
     SourcePort::ShatterGeometry(std::move(geometry));
@@ -164,6 +166,7 @@ bool TextureSplatOnGeometry(const std::vector<WorldBatch>& batches,Mth::Vector& 
 }
 namespace Nx {
 bool plat_texture_splat(CSector** sectors,CCollStatic**,Mth::Vector& start,Mth::Vector& end,float size,float lifetime,CTexture* texture,sSplatTrailInstanceDetails* trail){
+    if(source_application_os_is_old_3ds())return false;
     controller();Dbg_Assert(sectors);std::vector<SourcePort::WorldBatch> batches;auto view=actual_view();auto time=Tmr::GetTime();
     for(;*sectors;++sectors)if(auto* geom=dynamic_cast<CNativeGeom*>((*sectors)->GetGeom()))geom->Gather(view,time,batches,true,true);
     return SourcePort::TextureSplatOnGeometry(batches,start,end,size,lifetime,texture,trail);

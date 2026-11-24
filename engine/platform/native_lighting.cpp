@@ -1,4 +1,5 @@
 #include <source_port/native_lighting.h>
+#include <source_port/application_os.h>
 #include <source_port/thread_os.h>
 #include <algorithm>
 #include <cmath>
@@ -18,6 +19,7 @@ void CNativeModelLights::plat_enable_diffuse_light(int i,bool on){index(i);if(on
 void CNativeModelLights::plat_update_brightness(){plat_update_engine(position_,scene_light_);}
 void CNativeModelLights::plat_update_engine(Mth::Vector& position,bool scene_light){
     Dbg_Assert(source_thread_is_controller());position_=position;scene_light_=scene_light;
+    if(source_application_os_is_old_3ds())return;
     color(frame_.ambient,plat_is_ambient_light_enabled()?ambient_:CLightManager::sGetLightAmbientColor(),m_ambient_brightness);
     for(int i=0;i<2;++i){color(frame_.diffuse[i],plat_is_diffuse_light_enabled(i)?diffuse_[i]:CLightManager::sGetLightDiffuseColor(i),m_diffuse_brightness[i]);frame_.direction[i]=plat_get_light_direction(i);}
     frame_.diffuse[2]={};frame_.direction[2].Set(0,0,0,0);

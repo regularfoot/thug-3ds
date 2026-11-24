@@ -9,6 +9,15 @@
 #include <source_port/application_os.h>
 #include <source_port/memory.h>
 #include <source_port/graphics_os.h>
+#include <algorithm>
+#include <cstring>
+#include <cstdio>
+#include <strings.h>
+#ifdef __3DS__
+#include <sk/modules/skate/skate.h>
+#include <sk/modules/skate/gamemode.h>
+#include <gel/scripting/struct.h>
+#endif
 namespace SourcePort {
 namespace {
 std::string startup_save;
@@ -69,8 +78,17 @@ void read_startup_options(const std::string& root) {
     trial_level = compare_stereo_turns ? (manhattan_turn ? 1 : 7) : -1;
     if (dense_draw_trial && marker("trial_hawaii.txt")) trial_level = 4;
     if (dense_draw_trial && marker("trial_vancouver.txt")) trial_level = 5;
+    if (performance_route && marker("trial_slam_city.txt")) trial_level = 6;
+    if (performance_route && marker("trial_created_park.txt")) trial_level = 9;
     if (performance_route && marker("trial_school_ii.txt")) trial_level = 10;
     if (performance_route && marker("trial_venice.txt")) trial_level = 11;
+    if(performance_route){
+        if(FILE* file=std::fopen((root+"/trial_level.txt").c_str(),"r")){
+            unsigned selected=0;
+            if(std::fscanf(file,"%u",&selected)==1 && selected<=12)trial_level=int(selected);
+            std::fclose(file);
+        }
+    }
     compare_release_turn = moscow_turn_trial && marker("compare_moscow_release.txt");
     compare_city_options = performance_route && marker("compare_city_options.txt");
     reuse_static_prefix = !marker("exact_static_runs.txt");
@@ -103,6 +121,111 @@ void read_startup_options(const std::string& root) {
 }
 
 const char* StartupSaveName() { return startup_save.c_str(); }
+
+bool OldFreeSkateAmbientDisabled() {
+#ifdef __3DS__
+    if (!source_application_os_is_old_3ds()) return false;
+    auto* skate = Mdl::Skate::Instance();
+    if (!skate || !skate->GetGameMode()) return false;
+    // The retail High Score / Free Skate menu requests singlesession. The
+    // front end also uses these modes for preview stages and Create-A-Trick.
+    const auto requested = skate->GetGameType();
+    if (requested != 0x1ca38b5c && requested != 0x34861a16) return false;
+    if (skate->GetGameMode()->GetNameChecksum() != requested) return false;
+    switch (skate->m_requested_level) {
+        case 0xf6c822d4: // load_nj
+        case 0x7276630a: // load_ny
+        case 0xd7720de9: // load_fl
+        case 0xee1c63cf: // load_sd
+        case 0x399bd4e8: // load_hi
+        case 0x0d0f0229: // load_vc
+        case 0x09a44ec8: // load_sj
+        case 0x9db7727c: // load_ru
+        case 0x991b5359: // load_se
+        case 0x8ca30405: // load_sc2
+        case 0x73be7e94: // load_vn
+        case 0xa7ff414b: // load_hn
+        case 0x7078f66c: // load_sc
+        case 0xcc877c27: // load_ph
+        case 0x0c27ca5e: // load_dj
+        case 0xfc5833ee: // load_au
+        case 0xb664035d: // load_sk5ed_gameplay
+            return true;
+        default:
+            return false;
+    }
+#else
+    return false;
+#endif
+}
+
+bool OmitSceneryScript(unsigned checksum) {
+    switch(checksum){
+        case 223617057u: case 2871208853u: // All-star sign
+        case 1315561669u: case 475123554u: // Video screens
+        case 930395668u: case 2432941472u: // Jumbotron animation
+        case 624853004u: case 3157774774u: case 3408978208u:
+        case 1431598211u: case 1096100044u: // Crowd visual loops
+            return OldFreeSkateAmbientDisabled();
+        default:return false;
+    }
+}
+
+bool IsAmbientModelPath(const char* name) {
+    // QB model names are relative to models/. Match whole directory components.
+    if (!name) return false;
+    // Retain the Moscow tank model and its preloads in Old Free Skate.
+    std::string path(name);
+    std::replace(path.begin(), path.end(), '\\', '/');
+    if (!strcasecmp(path.c_str(), "veh/ru/veh_tank_ru/veh_tank_ru.mdl") ||
+        !strcasecmp(path.c_str(), "veh/ru/veh_tank_ru/veh_tank_ru") ||
+        !strcasecmp(path.c_str(), "veh/veh_skitchnode/veh_skitchnode.mdl") ||
+        !strcasecmp(path.c_str(), "veh/veh_skitchnode/veh_skitchnode")) return false;
+    for (const char* directory : {"peds", "ped_male", "ped_female", "animals", "veh"}) {
+        const auto length = std::strlen(directory);
+        if (!strncasecmp(name, directory, length) && (name[length] == '/' || name[length] == '\\')) return true;
+    }
+    return false;
+}
+
+bool OmitAmbientNode(Script::CStruct* node) {
+#ifdef __3DS__
+    if (!source_application_os_is_old_3ds()) return false;
+    uint32 type = 0;
+    node->GetChecksum(0x12b4e660 /* Class */, &type);
+    uint32 subtype = 0;
+    if (type == 0xe47f1b79 &&
+        node->GetChecksum(0x7321a8d6 /* Type */, &subtype) && subtype == 0x8ba78fe2 /* SkitchNode */)
+        return false;
+    const char* model = nullptr;
+    if (node->GetText(0x286a8d26 /* Model */, &model) && model) {
+        std::string path(model);
+        std::replace(path.begin(), path.end(), '\\', '/');
+        if (!strcasecmp(path.c_str(), "veh/ru/veh_tank_ru/veh_tank_ru.mdl") ||
+            !strcasecmp(path.c_str(), "veh/ru/veh_tank_ru/veh_tank_ru")) return false;
+    }
+    switch (type) {
+        case 0xa0dfac98: // Pedestrian
+        case 0x061a741e: // Ped
+        case 0xe47f1b79: // Vehicle
+        case 0x19b1e241: // ParticleEmitter
+        case 0x9e7d469e: // ParticleObject
+            break;
+        case 0xef59c100: { // GameObject can also be a rail, platform or pickup.
+            const char* model = nullptr;
+            if (!node->GetText(0x286a8d26 /* Model */, &model) || !IsAmbientModelPath(model)) return false;
+            break;
+        }
+        default:
+            return false;
+    }
+    return OldFreeSkateAmbientDisabled();
+#else
+    (void)node;
+    return false;
+#endif
+}
+
 bool SkipOpeningMovies() { return skip_opening; }
 bool HideVancouverAmbient() { return hide_vancouver_ambient; }
 static bool second_turn_variant(unsigned step){
