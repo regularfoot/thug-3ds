@@ -14,7 +14,7 @@ namespace SourcePort {
 void LoadStartupSaveWhenReady() {
     static bool attempted = false;
     const char* name = StartupSaveName();
-    if (attempted || !*name || !SaveStorageReady()) return;
+    if (attempted || !SaveStorageReady()) return;
 
     // The original card loader reapplies the story skater and refreshes CAS
     // through QB. Both the local skater and the frontend tree must exist.
@@ -22,6 +22,13 @@ void LoadStartupSaveWhenReady() {
         !Front::CScreenElementManager::Instance()->GetElement(CRCD(0x56a1eae3,"root_window")) ||
         !Script::Resolve("post_load_from_memory_card")) return;
     attempted = true;
+    if (!*name) {
+#ifdef __3DS__
+        // The opt-in automated menu route must also work on a clean profile.
+        BeginCityMenuTrial();
+#endif
+        return;
+    }
 #ifdef __3DS__
     BootPhase("startup_save_enter");
 #endif

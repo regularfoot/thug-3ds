@@ -12020,7 +12020,7 @@
    ]
   },
   "sk/scripting/skfuncs.cpp": {
-   "sha256": "3c7ccf179b8fbdf27e1dd4d5ffac358afdcd2e324800a3edee05420bfc9e87d2",
+   "sha256": "3d4c6f20a268e15b7a4bd602aeca4019949895d58ed894df6928eb138ed00a22",
    "edits": [
     [
      649,
@@ -12048,6 +12048,13 @@
      28326,
      [
       ";"
+     ]
+    ],
+    [
+     141033,
+     141033,
+     [
+      "#ifdef __3DS__\n    auto* skate = Mdl::Skate::Instance();\n    auto* net = GameNet::Manager::Instance();\n    if (pScript && skate && skate->GetGameMode() &&\n        SourcePort::FreeSkateLevelMenuOverride(pScript->mScriptChecksum, skate->GetGameType(),\n            skate->GetGameMode()->IsTrue(CRCD(0x1ded1ea4,\"is_career\")), net && net->InNetGame()))\n        return true;\n#endif\n"
      ]
     ]
    ]

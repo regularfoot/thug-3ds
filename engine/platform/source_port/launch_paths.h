@@ -10,6 +10,7 @@ bool SkipOpeningMovies();
 bool PerformanceRouteEnabled();
 bool HideVancouverAmbient();
 bool OldFreeSkateAmbientDisabled();
+bool FreeSkateLevelMenuOverride(unsigned script, unsigned game_type, bool career, bool network);
 bool OmitSceneryScript(unsigned checksum);
 bool OmitAmbientNode(Script::CStruct* node);
 bool IsAmbientModelPath(const char* name);

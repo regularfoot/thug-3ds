@@ -123,6 +123,13 @@ void read_startup_options(const std::string& root) {
 
 const char* StartupSaveName() { return startup_save.c_str(); }
 
+bool FreeSkateLevelMenuOverride(unsigned script, unsigned game_type, bool career, bool network) {
+    if (career || network || (game_type != 0x1ca38b5c && game_type != 0x34861a16)) return false;
+    // These retail QB scripts read level-unlock flags while building/counting
+    // entries and creating map markers. Never change the saved career flags.
+    return script == 0x780f8810 || script == 0xb8a8f7ed || script == 0xa2f7cb51;
+}
+
 bool OldFreeSkateAmbientDisabled() {
 #ifdef __3DS__
     if (!source_application_os_is_old_3ds()) return false;
