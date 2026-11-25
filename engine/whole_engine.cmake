@@ -89,7 +89,7 @@ if(NINTENDO_3DS)
     string(REGEX REPLACE "^#define THUG_SOURCE_BUILD \"([^\"]+)\".*" "\\1" source_build_id "${build_id_line}")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/engine/platform/source_port/build_id.h")
     ctr_generate_smdh(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/thug1_full_engine.smdh"
-        NAME "THUG1 ${source_build_id}" DESCRIPTION "THUG1 ${source_build_id} - Source Engine" AUTHOR "3DS port")
+        NAME "THUG 3DS" DESCRIPTION "Tony Hawk's Underground 3DS port" AUTHOR "3DS port")
     ctr_create_3dsx(thug1_full_engine SMDH "${CMAKE_CURRENT_BINARY_DIR}/thug1_full_engine.smdh")
     set_target_properties(thug1_full_engine_3dsx PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
