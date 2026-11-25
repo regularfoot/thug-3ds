@@ -1,12 +1,12 @@
 # thug-3ds
 
-An unofficial port of **Tony Hawk’s Underground** for the Nintendo 3DS. The current source build appears as **THUG 3DS** in the Homebrew Launcher. The original game loop runs on ARM11, the PICA200 renders the graphics, and the game reads its assets from the SD card.
+An unofficial port of **Tony Hawk’s Underground** for the Nintendo 3DS. Version **0.2.1** appears as **THUG 3DS** in the Homebrew Launcher. The original game loop runs on ARM11, the PICA200 renders the graphics, and the game reads its assets from the SD card.
 
 This repository contains the 3DS port code and build tools. To build a playable copy, you need **both** a supported PC installation (its `Game/Data` folder) and a compatible source checkout of the original engine that you have permission to use. The retail PC installation supplies the game assets.
 
 [Build and install in English](#build-and-install) · [Сборка и установка на русском](#сборка-и-установка)
 
-## Free Skate without a save
+## What’s new in 0.2.1
 
 On both New and Old 3DS, the Free Skate level selector makes levels available by default, including on a fresh install without a save. This only changes the selector: it does not complete Story goals or write unlock flags into career progress. The port still needs the retail game assets and authorized engine sources described below.
 
@@ -42,6 +42,7 @@ This release includes a fix for music cutting out a few seconds into a song in M
 
 ## Features and testing
 
+- In Azahar, a fresh profile without a save reached School II on Old 3DS and Moscow on New 3DS. The no-save level selection has not yet been verified on physical hardware.
 - On a physical Old 3DS, build 0325 ran several levels. Sampled mono frame rates varied from roughly 18 FPS in New Jersey to 31 FPS in Florida. Stereo and dense scenes were slower.
 - Build 0326 restores the SkitchNode used by Seattle's moving quarterpipe in Old 3DS Free Skate. The original movement script was exercised in Azahar. Hardware confirmation remains pending.
 
@@ -109,7 +110,7 @@ Install `thug1_source_engine_0329` alongside the previous build. Copy your `sour
 
 ## Сборка и установка
 
-Для сборки нужны установленная PC-версия игры и отдельно совместимые исходники движка, которые вы вправе использовать. Текущая сборка отображается в Homebrew Launcher как **THUG 3DS**.
+Для сборки нужны установленная PC-версия игры и отдельно совместимые исходники движка, которые вы вправе использовать. Версия 0.2.1 отображается в Homebrew Launcher как **THUG 3DS**.
 
 Рабочая конфигурация — macOS с Python **3.11+**, Git, Clang/Clang++, Make, CMake **3.20+**, Ninja и Docker с поддержкой Linux/amd64. Для исходников и временных файлов используйте локальную файловую систему. На macOS инструменты командной строки Apple предоставляют Clang и Make. Команды ниже выполняются **из корня этого комплекта**. Docker должен видеть каталог проекта. Доступ к сети нужен при первой установке инструментов и получении открытых библиотек.
 
