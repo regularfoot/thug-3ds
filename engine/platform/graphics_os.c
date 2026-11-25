@@ -768,6 +768,7 @@ static void draw_touch_controls(void) {
     memset(fb, 0, SOURCE_TOUCH_WIDTH * SOURCE_TOUCH_HEIGHT * sizeof(*fb));
     for (unsigned i = 0; i < SOURCE_TOUCH_ZONES; ++i) {
         const SourceTouchZone* zone = &source_touch_zones[i];
+        if (source_application_os_is_new_3ds() && i != SOURCE_TOUCH_ZONES - 1) continue;
         const u16 color = zone->buttons ? RGB8_to_565(36, 55, 67) : RGB8_to_565(17, 26, 32);
         for (int x = zone->x + 1; x < zone->x + zone->width - 1; ++x) {
             for (int y = zone->y + 1; y < zone->y + zone->height - 1; ++y)
@@ -784,6 +785,30 @@ static void draw_touch_controls(void) {
                 }
             }
         }
+    }
+    GSPGPU_FlushDataCache(fb, SOURCE_TOUCH_WIDTH * SOURCE_TOUCH_HEIGHT * sizeof(*fb));
+    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+}
+void source_graphics_controls_text(const char* text) {
+    if (!controller() || !gpu.open || !text) return;
+    if (!*text) { draw_touch_controls(); return; }
+    u16* fb = (u16*)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL);
+    if (!fb) return;
+    const ConsoleFont* font = &consoleGetDefault()->font;
+    memset(fb, 0, SOURCE_TOUCH_WIDTH * SOURCE_TOUCH_HEIGHT * sizeof(*fb));
+    int x = 0, y = 0;
+    for (const unsigned char* p = (const unsigned char*)text; *p && y < SOURCE_TOUCH_HEIGHT; ++p) {
+        if (*p == '\n') { x = 0; y += 8; continue; }
+        if (x + 8 > SOURCE_TOUCH_WIDTH) { x = 0; y += 8; }
+        if (y + 8 > SOURCE_TOUCH_HEIGHT) break;
+        if (*p >= font->asciiOffset && *p < font->asciiOffset + font->numChars) {
+            const u8* glyph = font->gfx + (*p - font->asciiOffset) * 8;
+            for (int row = 0; row < 8; ++row)
+                for (int col = 0; col < 8; ++col)
+                    if (glyph[row] & (0x80 >> col))
+                        fb[(x + col) * SOURCE_TOUCH_HEIGHT + SOURCE_TOUCH_HEIGHT - 1 - y - row] = 0xffff;
+        }
+        x += 8;
     }
     GSPGPU_FlushDataCache(fb, SOURCE_TOUCH_WIDTH * SOURCE_TOUCH_HEIGHT * sizeof(*fb));
     gfxScreenSwapBuffers(GFX_BOTTOM, false);
@@ -846,11 +871,9 @@ int source_graphics_open(void) {
     gspSetEventCallback(GSPGPU_EVENT_P3D,draw_finished,&irq_count[DRAW_IRQ],false);
     gspSetEventCallback(GSPGPU_EVENT_PPF,gpu_irq,&irq_count[TRANSFER_IRQ],false);
     gspSetEventCallback(GSPGPU_EVENT_VBlank0,vblank,NULL,false);
-    if (source_application_os_is_old_3ds()) {
-        gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
-        gfxSetDoubleBuffering(GFX_BOTTOM, false);
-        draw_touch_controls();
-    }
+    gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
+    draw_touch_controls();
     return 0;
 }
 static void release_blur(void){
@@ -923,7 +946,7 @@ static int capture_rgb(unsigned eye,uint8_t* rgb,size_t size){
 int source_graphics_capture_rgb(uint8_t* rgb,size_t size){return capture_rgb(0,rgb,size);}
 void source_graphics_debug_text(const char* text){
     if(!controller()||!gpu.open||!text)return;
-    if(!*text && source_application_os_is_old_3ds()){draw_touch_controls();return;}
+    if(!*text){draw_touch_controls();return;}
     if(!gpu.console_ready){consoleInit(GFX_BOTTOM,NULL);gpu.console_ready=1;}printf("\x1b[2J\x1b[H%s",text);
     u16 w,h;u8* fb=gfxGetFramebuffer(GFX_BOTTOM,GFX_LEFT,&w,&h);if(fb)GSPGPU_FlushDataCache(fb,(size_t)w*h*sizeof(u16));
 }
@@ -1843,6 +1866,7 @@ SourceGraphicsLists source_graphics_frame_lists(void){return (SourceGraphicsList
 SourceGraphicsWait source_graphics_frame_wait(void){return (SourceGraphicsWait){0};}
 int source_graphics_capture_rgb(uint8_t* p,size_t s){(void)p;(void)s;errno=ENOTSUP;return -1;}
 void source_graphics_debug_text(const char* p){(void)p;}
+void source_graphics_controls_text(const char* p){(void)p;}
 int source_graphics_stream_write_reserved(SourceGpuMesh** m,size_t n,size_t ni,size_t nr,SourceStreamWriter writer,void* context,SourceStreamCapacity* capacity){
     (void)m;(void)n;(void)ni;(void)nr;(void)writer;(void)context;(void)capacity;errno=ENOTSUP;return -1;
 }

@@ -9,6 +9,7 @@
 #include <source_port/application_os.h>
 #include <source_port/memory.h>
 #include <source_port/graphics_os.h>
+#include <source_port/input_os.h>
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
@@ -323,6 +324,7 @@ void ConfigureGameLaunchPaths(int argc,char** argv){
     struct stat st{};Dbg_MsgAssert(stat(paths.data.c_str(),&st)==0&&S_ISDIR(st.st_mode),("Missing original game Data at %s",paths.data.c_str()));
     Dbg_Assert(ConfigureFileRoots(paths.data.c_str()));Dbg_Assert(ConfigureSaveRoot(paths.saves.c_str()));
     Dbg_MsgAssert(OpenDiagnosticLog(paths.journal.c_str()),("Cannot open this build's journal: %s",paths.journal.c_str()));
+    source_input_set_settings_root(paths.root.c_str());
     read_startup_options(paths.root);
     Log("Whole original source-engine launch: resources=%s isolated-saves=%s",paths.data.c_str(),paths.saves.c_str());
 #ifdef THUG_ARM_LTO

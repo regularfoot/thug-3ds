@@ -152,6 +152,7 @@ int source_graphics_capture_rgb(uint8_t*,size_t);
 // Linear 240x400 ABGR display-transfer buffer -> top-first 400x240 RGB.
 int source_graphics_unpack_capture(const uint8_t*,size_t,uint8_t*,size_t);
 void source_graphics_debug_text(const char*);
+void source_graphics_controls_text(const char*);
 int source_graphics_set_blur(unsigned amount);
 int source_graphics_blend_rgb(uint8_t* current,const uint8_t* previous,size_t bytes,unsigned amount);
 SourceGpuMesh* source_graphics_mesh_create(const SourceRenderVertex*,size_t);

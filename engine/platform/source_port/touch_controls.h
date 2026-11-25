@@ -4,7 +4,7 @@
 extern "C" {
 #endif
 
-enum { SOURCE_TOUCH_WIDTH = 320, SOURCE_TOUCH_HEIGHT = 240, SOURCE_TOUCH_ZONES = 6 };
+enum { SOURCE_TOUCH_WIDTH = 320, SOURCE_TOUCH_HEIGHT = 240, SOURCE_TOUCH_ZONES = 7 };
 typedef struct SourceTouchZone {
     int x, y, width, height;
     uint16_t buttons;
